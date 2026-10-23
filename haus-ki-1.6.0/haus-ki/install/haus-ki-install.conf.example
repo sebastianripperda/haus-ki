@@ -1,0 +1,50 @@
+# Vorgaben für install/haus-ki-lxc.sh
+#
+# So verwendest du diese Datei:
+#   cp haus-ki-install.conf.example haus-ki-install.conf
+#   nano haus-ki-install.conf
+# Jeder Wert erscheint im Skript als Vorschlag und lässt sich dort noch ändern.
+# Ohne diese Datei fragt das Skript alles ab und schlägt sinnvolle Werte vor.
+#
+# Keine Geheimnisse hier eintragen! Tokens, API-Schlüssel und Passwörter fragt das Skript
+# verdeckt ab und speichert sie verschlüsselt in Haus-KI.
+
+# ---------------------------------------------------------------- Container und Netzwerk
+CTID=                           # leer = nächste freie ID
+CT_HOST=haus-ki
+STORAGE=local-lvm
+BRIDGE=vmbr0
+IPCFG=dhcp                      # oder feste Adresse mit Präfix, z. B. 192.168.1.40/24
+GW=                             # nur bei fester Adresse, z. B. 192.168.1.1
+DNS=                            # leer = Gateway
+DNSNAME=                        # Name im Heimnetz, z. B. ki.home (leer = IP-Adresse verwenden)
+
+# ---------------------------------------------------------------- Proxmox
+CONF_NODE=                      # leer = Name dieses Hosts
+PVE_HOST=                       # leer = Adresse der Netzwerkbrücke
+
+# ---------------------------------------------------------------- Ollama
+OLLAMA_VMID=                    # ID des Ollama-Containers oder der Ollama-VM; leer = automatisch suchen
+OLLAMA_URL=                     # leer = http://<IP des Ollama-Gasts>:11434
+PULL_MODELS=j                   # qwen3:8b, qwen3:4b, llama3.2:3b und bge-m3 laden, falls sie fehlen
+PULL_MOE=j                      # zusätzlich qwen3:30b-a3b zum Vergleich (nur bei mindestens 30 GB RAM)
+
+# ---------------------------------------------------------------- Paperless-ngx (optional)
+PAPERLESS_URL=                  # z. B. http://192.168.1.20:8000; leer = später einrichten
+PAPERLESS_UPLOAD=true
+PAPERLESS_WRITE_TAGS=false
+PAPERLESS_DEADLINES=true
+PAPERLESS_DEADLINE_DAYS=14
+
+# ---------------------------------------------------------------- Jellyfin (optional)
+JELLYFIN_URL=                   # z. B. http://192.168.1.21:8096; leer = später einrichten
+JELLYFIN_PLAYBACK=true
+
+# ---------------------------------------------------------------- Websuche (optional)
+WEB_SEARCH=j                    # Schlüssel von ollama.com › Settings › Keys, wird verdeckt abgefragt
+
+# ---------------------------------------------------------------- Sicherheit und Sicherung
+GUARD_OLLAMA=j                  # Ollama-Port 11434 nur noch für Haus-KI öffnen
+OLLAMA_EXTRA=                   # weitere Adressen mit Zugriff auf Ollama, mit Komma getrennt
+TUNE_OLLAMA=j                   # Flash Attention und kompakter Kontextspeicher
+BACKUP_STORAGE=                 # Proxmox-Speicher für die nächtliche Sicherung (leer = Vorschlag)

@@ -1,0 +1,21 @@
+[Unit]
+Description=Haus-KI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hauski
+Group=hauski
+EnvironmentFile=/etc/haus-ki/haus-ki.env
+WorkingDirectory=/opt/haus-ki/current/app
+ExecStart=/opt/haus-ki/current/venv/bin/uvicorn hauski.main:app --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-keep-alive 30
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/haus-ki
+
+[Install]
+WantedBy=multi-user.target

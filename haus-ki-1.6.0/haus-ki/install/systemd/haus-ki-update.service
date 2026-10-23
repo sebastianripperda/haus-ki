@@ -1,0 +1,6 @@
+[Unit]
+Description=Haus-KI aktualisieren
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/haus-ki-update

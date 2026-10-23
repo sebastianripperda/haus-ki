@@ -1,0 +1,8 @@
+[Unit]
+Description=Haus-KI: Update-Aufträge aus der Oberfläche
+
+[Path]
+PathExists=/var/lib/haus-ki/updates/request
+
+[Install]
+WantedBy=multi-user.target

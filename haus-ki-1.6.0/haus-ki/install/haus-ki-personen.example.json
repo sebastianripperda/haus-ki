@@ -1,0 +1,6 @@
+[
+  {"name": "Anna", "role": "admin",  "email": "anna@example.org", "jellyfin_user": "anna", "learn": false},
+  {"name": "Tom",  "role": "admin",  "email": "tom@example.org",  "jellyfin_user": "tom",  "learn": false},
+  {"name": "Mia",  "role": "member", "email": "mia@example.org",  "jellyfin_user": "mia",  "learn": true, "paperless": false},
+  {"name": "Leo",  "role": "member", "email": "",                 "jellyfin_user": "leo",  "learn": true, "paperless": false}
+]
