@@ -6,7 +6,7 @@ import json
 import time
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from .. import __version__, db, ollama, scheduler, settings, system, users
@@ -95,7 +95,7 @@ async def overview(user=Depends(require_admin)):
     if not settings.get("agent.url"):
         warnings.append("Der Agent im Ollama-Container ist nicht eingerichtet. Server-Einstellungen lassen sich nicht ändern.")
     if not settings.get("ms.enabled"):
-        warnings.append("Die Anmeldung über Microsoft ist noch nicht eingerichtet. Nur der Notfall-Zugang funktioniert.")
+        warnings.append("Die Anmeldung über Microsoft ist noch nicht eingerichtet. Es funktionieren nur die lokale Anmeldung und der Notfall-Zugang.")
     if any(r["status"] == "error" for r in runs):
         warnings.append("Mindestens eine Nachtaufgabe ist letzte Nacht fehlgeschlagen.")
     vm = None
@@ -121,22 +121,61 @@ def users_list(user=Depends(require_admin)):
     return out
 
 
+def _login_body(body: dict, has_local_pw: bool) -> tuple[str | None, str | None]:
+    """Prüft Anmeldeart und lokales Passwort aus einer Anfrage. Gibt (Anmeldeart, Passwort) zurück."""
+    mode = body.get("login")
+    if mode is not None and mode not in users.LOGIN_MODES:
+        raise HTTPException(400, "Unbekannte Anmeldeart.")
+    pw = body.get("local_password") or None
+    if pw:
+        try:
+            users.check_local_password(pw)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if mode in ("local", "both") and not pw and not has_local_pw:
+        raise HTTPException(400, "Für die lokale Anmeldung bitte zuerst ein Passwort vergeben.")
+    return mode, pw
+
+
 @router.post("/users")
 def user_add(body: dict, user=Depends(require_admin)):
-    name = (body.get("name") or "").strip()
+    name = (body.get("name") or "").strip()[:40]
     if not name:
         raise HTTPException(400, "Bitte einen Namen angeben.")
-    uid = users.create(name, "admin" if body.get("role") == "admin" else "member", email=body.get("email", ""))
-    audit(user["name"], "Einstellung", f"Benutzer {name} angelegt")
+    if db.row("SELECT id FROM users WHERE lower(name)=lower(?)", (name,)):
+        raise HTTPException(400, f"Es gibt schon eine Person mit dem Namen {name}.")
+    mode, pw = _login_body({**body, "login": body.get("login") or "m365"}, False)
+    uid = users.create(name, "admin" if body.get("role") == "admin" else "member", email=(body.get("email") or "").strip(),
+                       login=mode, local_password=pw)
+    audit(user["name"], "Einstellung", f"Benutzer {name} angelegt, Anmeldung: {users.LOGIN_LABELS[mode]}"
+          + (", lokales Passwort gesetzt" if pw else ""))
     return {"id": uid}
 
 
 @router.put("/users/{uid}")
-def user_update(uid: int, body: dict, user=Depends(require_admin)):
+def user_update(uid: int, body: dict, request: Request, user=Depends(require_admin)):
     u = users.get(uid)
     if not u:
         raise HTTPException(404)
     from .. import security
+    mode, local_pw = _login_body(body, bool(u["local_pw"]) and not body.get("remove_local_password"))
+    if body.get("remove_local_password") and (mode or users.login_mode(u)) != "m365":
+        raise HTTPException(400, "Das lokale Passwort lässt sich nur entfernen, wenn die Person sich nur über Microsoft 365 anmeldet.")
+    own_sid = request.cookies.get("hk_session", "")
+    if local_pw:
+        users.set_local_password(uid, local_pw)
+        # Neues Passwort: andere lokale Sitzungen dieser Person beenden
+        db.run("DELETE FROM sessions WHERE user_id=? AND method='Lokal' AND id<>?", (uid, own_sid))
+    if body.get("remove_local_password"):
+        users.set_local_password(uid, None)
+    if mode and mode != users.login_mode(u):
+        db.run("UPDATE users SET login=? WHERE id=?", (mode, uid))
+        # Sitzungen über eine nicht mehr erlaubte Anmeldeart beenden (die eigene laufende Sitzung bleibt)
+        gone = "Lokal" if mode == "m365" else "Microsoft" if mode == "local" else None
+        if gone:
+            db.run("DELETE FROM sessions WHERE user_id=? AND method=? AND id<>?", (uid, gone, own_sid))
+        if mode == "local":
+            db.run("DELETE FROM ms_tokens WHERE user_id=? AND audience='graph'", (uid,))
     if "name" in body:
         db.run("UPDATE users SET name=? WHERE id=?", (str(body["name"])[:40], uid))
     if "email" in body:
@@ -165,8 +204,11 @@ def user_update(uid: int, body: dict, user=Depends(require_admin)):
         users.set_personal_secret(uid, "paperless_token", body["paperless_token"] or "")
     if body.get("unlock"):
         db.run("UPDATE users SET failed_logins=0, locked_until=0 WHERE id=?", (uid,))
-    audit(user["name"], "Einstellung", f"Benutzer {u['name']} geändert: {', '.join(k for k in body if k != 'password')}"
-          + (", Notfall-Passwort gesetzt" if body.get("password") else ""))
+    secret = ("password", "local_password")
+    audit(user["name"], "Einstellung", f"Benutzer {u['name']} geändert: {', '.join(k for k in body if k not in secret)}"
+          + (", Notfall-Passwort gesetzt" if body.get("password") else "")
+          + (", lokales Passwort gesetzt" if local_pw else "")
+          + (f", Anmeldung: {users.LOGIN_LABELS[mode]}" if mode and mode != users.login_mode(u) else ""))
     return {"ok": True}
 
 

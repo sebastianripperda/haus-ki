@@ -1,13 +1,16 @@
 /* Haus-KI Service Worker: schnelles Laden, Push-Benachrichtigungen, „Teilen an Haus-KI“.
    Daten aus /api werden nie zwischengespeichert. */
-const SHELL = "hk-shell-v2";
+const V = "__HK_VERSION__";  // setzt der Server beim Ausliefern ein
+const SHELL = "hk-shell-" + V;
 const SHARE = "hk-share";
-const ASSETS = ["/", "/static/app.css", "/static/md.js", "/static/theme.js", "/static/core.js", "/static/login.js", "/static/shell.js",
-  "/static/knx.js", "/static/pages.js", "/static/chat.js", "/static/composer.js", "/static/commands.js", "/static/dialogs.js", "/static/voice.js",
-  "/static/admin.js", "/static/icons/icon-192.png", "/static/fonts/inter-latin-400-normal.woff2", "/static/fonts/inter-latin-700-normal.woff2"];
+// Skripte und Stile mit Versionsnummer: nach einem Update sind es neue Adressen, alte Kopien werden nie mehr benutzt
+const ASSETS = ["/", ...["app.css", "md.js", "theme.js", "core.js", "login.js", "shell.js", "knx.js", "pages.js", "chat.js", "composer.js",
+  "commands.js", "dialogs.js", "voice.js", "admin.js",
+  "admin-ki.js", "admin-quellen.js", "admin-system.js", "admin-menschen.js"].map((f) => `/static/${f}?v=${V}`),
+  "/static/icons/icon-192.png", "/static/fonts/inter-latin-400-normal.woff2", "/static/fonts/inter-latin-700-normal.woff2"];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(SHELL).then((c) => c.addAll(ASSETS).catch(() => {})).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(SHELL).then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: "reload" }))).catch(() => {})).then(() => self.skipWaiting()));
 });
 self.addEventListener("activate", (e) => {
   e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== SHELL && k !== SHARE).map((k) => caches.delete(k))))

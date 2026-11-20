@@ -1,13 +1,14 @@
 """Endpunkte für alle angemeldeten Personen."""
 import asyncio
 import json
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .. import auth, chat, db, ollama, scheduler, settings, system, users
+from .. import auth, chat, db, ollama, scheduler, security, settings, system, users
 from ..auth import current_user
 from ..events import audit, hub
 from ..jobs import queue
@@ -26,7 +27,7 @@ def me(user=Depends(current_user)):
         "paperless_upload": bool(settings.get("paperless.enabled") and settings.get("paperless.upload") and out["perms"]["paperless"]),
         "jellyfin": bool(settings.get("jellyfin.enabled") and out["perms"]["jellyfin"]),
         "knx": bool(settings.get("knx.enabled") and out["perms"]["knx"]),
-        "m365": bool(settings.get("ms.enabled") and out["perms"]["m365"]),
+        "m365": bool(settings.get("ms.enabled") and out["perms"]["m365"] and users.allows_m365(user)),
         "mail": bool(out["perms"]["mail"] and mailbox.accounts(user["id"])),
         "web": bool(settings.get("web.enabled") and out["perms"]["web"]),
         "memory": bool(out["perms"]["memory"]),
@@ -45,9 +46,40 @@ def me(user=Depends(current_user)):
     out["helper_model"] = settings.get("ollama.helper_model")
     out["num_ctx"] = settings.get("req.num_ctx")
     out["retention_days"] = settings.get("chat.retention_days")
-    out["mail_allowed"] = {k: settings.get(f"mail.allow_{k}") for k in ("gmx", "gmail", "outlookcom")}
+    out["mail_allowed"] = {k: mailbox.allowed(k) for k in mailbox.PROVIDERS}
     out["family"] = [users.public(u) for u in db.rows("SELECT * FROM users WHERE disabled=0 ORDER BY id")]
     return out
+
+
+class PasswordIn(BaseModel):
+    current: str
+    new: str
+
+
+@router.put("/me/password")
+def change_password(body: PasswordIn, request: Request, user=Depends(current_user)):
+    """Eigenes Passwort für die lokale Anmeldung ändern."""
+    if not users.allows_local(user) or not user["local_pw"]:
+        raise HTTPException(400, "Für dein Konto ist keine lokale Anmeldung eingerichtet.")
+    if user["locked_until"] > db.now():
+        raise HTTPException(429, "Zu viele Fehlversuche. Versuche es später erneut.")
+    if not security.verify_password(body.current, user["local_pw"]):
+        failed = user["failed_logins"] + 1
+        lock = db.now() + settings.get("login.lock_minutes") * 60 if failed >= settings.get("login.max_failed") else 0
+        db.run("UPDATE users SET failed_logins=?, locked_until=? WHERE id=?", (failed if not lock else 0, lock, user["id"]))
+        audit(user["name"], "Anmeldung", "Passwortänderung: bisheriges Passwort falsch")
+        raise HTTPException(400, "Das bisherige Passwort stimmt nicht.")
+    try:
+        users.check_local_password(body.new)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if body.new == body.current:
+        raise HTTPException(400, "Das neue Passwort muss sich vom bisherigen unterscheiden.")
+    users.set_local_password(user["id"], body.new)
+    # Andere lokale Sitzungen beenden, die aktuelle bleibt
+    db.run("DELETE FROM sessions WHERE user_id=? AND method='Lokal' AND id<>?", (user["id"], request.cookies.get(auth.COOKIE, "")))
+    audit(user["name"], "Anmeldung", "Eigenes Passwort für die lokale Anmeldung geändert")
+    return {"ok": True}
 
 
 @router.put("/me/prefs")
@@ -103,51 +135,167 @@ class AccIn(BaseModel):
     kind: str
     address: str
     password: str = ""
+    username: str = ""   # nur nötig, wenn er von der E-Mail-Adresse abweicht
+    host: str = ""       # nur bei „Anderer Anbieter“
+    port: int = 993
+    security: str = "ssl"
+
+
+def _acc_public(a: dict) -> dict:
+    c = mailbox.conf(a)
+    saved = db.jload(a.get("config"), {}) or {}
+    p = mailbox.PROVIDERS.get(a["kind"], {})
+    return {"id": a["id"], "kind": a["kind"], "label": mailbox.LABEL.get(a["kind"], a["kind"]), "address": a["address"],
+            "drafts": bool(a["drafts"]), "connected": bool(a["secret"]), "oauth": bool(p.get("oauth")),
+            "username": saved.get("username", ""), "host": c["host"] if p.get("custom") else "",
+            "port": c["port"] if p.get("custom") else None, "security": c["security"] if p.get("custom") else None,
+            "error": saved.get("error", ""), "checked": saved.get("checked")}
+
+
+def _config_from(body, kind: str) -> dict:
+    """Prüft und baut die gespeicherten Verbindungsdaten."""
+    cfg = {"username": body.username.strip()[:200]}
+    if mailbox.PROVIDERS[kind].get("custom"):
+        host = body.host.strip().lower()
+        if not host or not re.fullmatch(r"[a-z0-9.\-]{1,253}", host):
+            raise HTTPException(400, "Bitte einen gültigen IMAP-Server angeben, z. B. imap.example.org.")
+        if not 1 <= int(body.port or 0) <= 65535:
+            raise HTTPException(400, "Bitte einen gültigen Port angeben (meist 993).")
+        if body.security not in mailbox.SECURITY:
+            raise HTTPException(400, "Bitte SSL/TLS oder STARTTLS wählen.")
+        cfg.update(host=host, port=int(body.port), security=body.security)
+    return cfg
 
 
 @router.get("/accounts")
 def accounts(user=Depends(current_user)):
-    out = [{"id": a["id"], "kind": a["kind"], "address": a["address"], "drafts": bool(a["drafts"]),
-            "connected": bool(a["secret"])} for a in mailbox.accounts(user["id"])]
+    out = [_acc_public(a) for a in mailbox.accounts(user["id"])]
     ms = db.row("SELECT expires FROM ms_tokens WHERE user_id=? AND audience='graph'", (user["id"],))
-    return {"accounts": out, "m365": {"connected": bool(ms), "email": user["email"]}}
+    providers = [{"id": k, "label": v["label"], "help": v["help"], "custom": bool(v.get("custom")), "oauth": bool(v.get("oauth"))}
+                 for k, v in mailbox.PROVIDERS.items() if mailbox.allowed(k)]
+    return {"accounts": out, "providers": providers,
+            "m365": {"connected": bool(ms), "email": user["email"], "allowed": users.allows_m365(user)}}
 
 
 @router.post("/accounts")
 async def account_add(body: AccIn, user=Depends(current_user)):
-    if body.kind not in ("gmx", "gmail", "outlookcom") or not mailbox.allowed(body.kind):
+    if body.kind not in mailbox.PROVIDERS or not mailbox.allowed(body.kind):
         raise HTTPException(400, "Dieser Anbieter ist nicht freigegeben.")
-    if body.kind != "outlookcom":
-        acc = {"kind": body.kind, "address": body.address.strip(), "secret": None}
-        from .. import security
-        acc["secret"] = security.encrypt(body.password.replace(" ", ""))
-        try:
-            await mailbox.test_login(acc)
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"Anmeldung bei {mailbox.LABEL[body.kind]} fehlgeschlagen: {e}. "
-                                     "Prüfe Adresse und App-Passwort und ob IMAP im Postfach eingeschaltet ist.")
-        aid = db.run("INSERT INTO accounts(user_id,kind,address,secret,created) VALUES(?,?,?,?,?)",
-                     (user["id"], body.kind, acc["address"], acc["secret"], db.now()))
-        audit(user["name"], "Einstellung", f"Postfach {mailbox.LABEL[body.kind]} verbunden")
-        return {"id": aid}
-    aid = db.run("INSERT INTO accounts(user_id,kind,address,created) VALUES(?,?,?,?)",
-                 (user["id"], "outlookcom", body.address.strip(), db.now()))
-    url = auth.authorize_url(f"outlookcom:{aid}", ["offline_access", "User.Read", "Mail.ReadWrite"], tenant="consumers",
-                             prompt="select_account")
-    return {"id": aid, "redirect": url}
+    address = body.address.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address):
+        raise HTTPException(400, "Bitte eine gültige E-Mail-Adresse angeben.")
+    same = db.row("SELECT * FROM accounts WHERE user_id=? AND kind=? AND lower(address)=lower(?)", (user["id"], body.kind, address))
+    if body.kind == "outlookcom":
+        if not (settings.get("ms.client_id") and settings.get("ms.client_secret")):
+            raise HTTPException(400, "Für Outlook.com muss ein Administrator zuerst die Microsoft-App-Registrierung eintragen "
+                                     "(Administration › Microsoft 365), mit Kontotyp inklusive privater Microsoft-Konten.")
+        if same and same["secret"]:
+            raise HTTPException(400, "Dieses Postfach ist schon verbunden.")
+        aid = same["id"] if same else db.run("INSERT INTO accounts(user_id,kind,address,created) VALUES(?,?,?,?)",
+                                             (user["id"], "outlookcom", address, db.now()))
+        url = auth.authorize_url(f"outlookcom:{aid}", ["offline_access", "User.Read", "Mail.ReadWrite"], tenant="consumers",
+                                 prompt="select_account")
+        return {"id": aid, "redirect": url}
+    if same:
+        raise HTTPException(400, "Dieses Postfach ist schon verbunden. Ändere bei Bedarf das Passwort am vorhandenen Eintrag.")
+    password = mailbox.clean_password(body.kind, body.password)
+    if not password:
+        raise HTTPException(400, "Bitte das Passwort angeben.")
+    cfg = _config_from(body, body.kind)
+    acc = {"id": None, "kind": body.kind, "address": address, "secret": None, "config": db.jdump(cfg)}
+    try:
+        info = await mailbox.test_login(acc, password)
+    except mailbox.MailError as e:
+        audit(user["name"], "Einstellung", f"Postfach {mailbox.LABEL[body.kind]} konnte nicht verbunden werden")
+        raise HTTPException(400, f"Anmeldung bei {mailbox.LABEL[body.kind]} fehlgeschlagen: {e}")
+    cfg.update(checked=db.now(), error="")
+    aid = db.run("INSERT INTO accounts(user_id,kind,address,secret,config,created) VALUES(?,?,?,?,?,?)",
+                 (user["id"], body.kind, address, security.encrypt(password), db.jdump(cfg), db.now()))
+    audit(user["name"], "Einstellung", f"Postfach {mailbox.LABEL[body.kind]} ({address}) verbunden")
+    return {"id": aid, "text": info}
+
+
+class AccUpdate(BaseModel):
+    drafts: bool | None = None
+    password: str | None = None
+    username: str | None = None
+    host: str | None = None
+    port: int | None = None
+    security: str | None = None
+
+
+def _own_account(aid: int, user: dict) -> dict:
+    q = ",".join("?" * len(mailbox.KINDS))
+    a = db.row(f"SELECT * FROM accounts WHERE id=? AND user_id=? AND kind IN ({q})", (aid, user["id"], *mailbox.KINDS))
+    if not a:
+        raise HTTPException(404, "Postfach nicht gefunden.")
+    return a
 
 
 @router.patch("/accounts/{aid}")
-def account_update(aid: int, body: dict, user=Depends(current_user)):
-    db.run("UPDATE accounts SET drafts=? WHERE id=? AND user_id=?", (1 if body.get("drafts") else 0, aid, user["id"]))
-    return {"ok": True}
+async def account_update(aid: int, body: AccUpdate, user=Depends(current_user)):
+    a = _own_account(aid, user)
+    if body.drafts is not None:
+        db.run("UPDATE accounts SET drafts=? WHERE id=?", (1 if body.drafts else 0, aid))
+    login_change = any(v is not None for v in (body.password, body.username, body.host, body.port, body.security))
+    if not login_change:
+        return {"ok": True}
+    if a["kind"] == "outlookcom":
+        raise HTTPException(400, "Outlook.com wird über die Microsoft-Anmeldung verbunden, nicht mit Passwort.")
+    # Neue Angaben erst prüfen, dann speichern: ein Tippfehler legt ein funktionierendes Postfach nicht lahm
+    old = db.jload(a["config"], {}) or {}
+    c = mailbox.conf(a)
+    merged = AccIn(kind=a["kind"], address=a["address"],
+                   username=body.username if body.username is not None else old.get("username", ""),
+                   host=body.host if body.host is not None else c["host"],
+                   port=body.port if body.port is not None else c["port"],
+                   security=body.security if body.security is not None else c["security"])
+    cfg = _config_from(merged, a["kind"])
+    password = mailbox.clean_password(a["kind"], body.password) if body.password else security.decrypt(a["secret"])
+    if not password:
+        raise HTTPException(400, "Bitte das Passwort angeben.")
+    try:
+        info = await mailbox.test_login({**a, "config": db.jdump(cfg)}, password)
+    except mailbox.MailError as e:
+        # Nur der Änderungsversuch ist gescheitert; das gespeicherte Postfach bleibt, wie es war
+        raise HTTPException(400, f"Anmeldung fehlgeschlagen, nichts geändert: {e}")
+    cfg.update(checked=db.now(), error="")
+    db.run("UPDATE accounts SET secret=?, config=? WHERE id=?", (security.encrypt(password), db.jdump(cfg), aid))
+    audit(user["name"], "Einstellung", f"Zugangsdaten für Postfach {a['address']} geändert"
+          + (", neues Passwort" if body.password else ""))
+    return {"ok": True, "text": info}
+
+
+@router.post("/accounts/{aid}/test")
+async def account_test(aid: int, user=Depends(current_user)):
+    a = _own_account(aid, user)
+    if a["kind"] == "outlookcom":
+        if not a["secret"]:
+            return {"ok": False, "text": "Die Anmeldung bei Microsoft wurde noch nicht abgeschlossen."}
+        try:
+            from ..tools import m365
+            async with await m365.client(user["id"], f"outlookcom:{aid}") as c:
+                (await c.get("/me/mailFolders/inbox", params={"$select": "totalItemCount"})).raise_for_status()
+            mailbox.mark(aid, None)
+            return {"ok": True, "text": "Verbindung zu Outlook.com steht."}
+        except Exception as e:  # noqa: BLE001
+            mailbox.mark(aid, str(e)[:300])
+            return {"ok": False, "text": str(e)[:300] or "Outlook.com antwortet nicht."}
+    try:
+        info = await mailbox.test_login(a)
+    except mailbox.MailError as e:
+        mailbox.mark(aid, str(e)[:300])
+        return {"ok": False, "text": str(e)}
+    mailbox.mark(aid, None)
+    return {"ok": True, "text": info}
 
 
 @router.delete("/accounts/{aid}")
 def account_delete(aid: int, user=Depends(current_user)):
-    db.run("DELETE FROM accounts WHERE id=? AND user_id=? AND kind IN ('gmx','gmail','outlookcom')", (aid, user["id"]))
+    a = _own_account(aid, user)
+    db.run("DELETE FROM accounts WHERE id=?", (aid,))
     db.run("DELETE FROM ms_tokens WHERE user_id=? AND audience=?", (user["id"], f"outlookcom:{aid}"))
-    audit(user["name"], "Einstellung", "Postfach entfernt")
+    audit(user["name"], "Einstellung", f"Postfach {a['address']} entfernt")
     return {"ok": True}
 
 
@@ -272,7 +420,7 @@ def template_delete(tid: int, user=Depends(current_user)):
 @router.get("/start")
 def start(user=Depends(current_user)):
     ins = db.rows("SELECT * FROM insights WHERE user_id=? AND done=0 ORDER BY created DESC", (user["id"],))
-    out = {"suggestions": [], "deadlines": [], "calendar": []}
+    out = {"suggestions": [], "deadlines": [], "calendar": [], "mails": []}
     seen = set()
     for i in ins:
         d = db.jload(i["data"], {}) | {"id": i["id"]}
@@ -283,6 +431,8 @@ def start(user=Depends(current_user)):
             out["deadlines"].append(d)
         elif i["kind"] == "calendar":
             out["calendar"].append(d)
+        elif i["kind"] == "mail":
+            out["mails"].append(d)
     out["deadlines"].sort(key=lambda d: d.get("due", ""))
     out["calendar"].sort(key=lambda d: d.get("when", ""))
     return out

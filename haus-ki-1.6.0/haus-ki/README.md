@@ -19,7 +19,11 @@ text-to-speech (Piper).*
   „Wie warm ist es im Bad?“ (KNX), „Welchen Film haben wir noch nicht gesehen?“ (Jellyfin). Jede Antwort nennt ihre Quellen.
 - **Handeln nur nach Bestätigung:** Licht, Rollläden, Wiedergabe, To-Do-Einträge und Mail-Entwürfe schlägt Haus-KI vor.
   Ausgeführt wird erst nach einem Klick oder einem klaren „Ja“. Harmloses kann jede Person für sich freigeben.
-- **Für die ganze Familie:** Microsoft-Anmeldung, Rollen, Rechte pro Person und Raum, eine einfache Ansicht und ein Lernmodus für Kinder,
+- **Private Postfächer:** GMX, WEB.DE, Gmail, T-Online, iCloud, Yahoo und eigene Mailserver mit Benutzername und Passwort (IMAP),
+  Outlook.com über die Microsoft-Anmeldung. Jede Person verbindet ihre Postfächer selbst unter „Meine Konten“.
+  Haus-KI durchsucht Posteingang, Gesendet und Archiv, liest Mails auf Wunsch ganz und meldet morgens neue Rechnungen,
+  Mahnungen und Fristen.
+- **Für die ganze Familie:** Anmeldung über Microsoft, lokal mit Haus-KI-Passwort oder beides (pro Person einstellbar), Rollen, Rechte pro Person und Raum, eine einfache Ansicht und ein Lernmodus für Kinder,
   gemeinsames Familienwissen und ein persönliches Gedächtnis.
 - **Sprache:** Spracheingabe mit Whisper, Vorlesen mit Piper, Gesprächsmodus. Alles lokal, Aufnahmen werden nie gespeichert.
 - **Nachts:** Sicherung, Fristen aus Paperless, Abgleich des Familienkalenders, geplante Prompts, Suchindex.
@@ -146,12 +150,13 @@ passende `.sha256`. Beides als Release auf GitHub hochladen. Persönliche Vorgab
 | Problem | Prüfen |
 |---|---|
 | Container startet nicht | `bash install/haus-ki-diagnose.sh` |
+| iPhone/iPad zeigt nach einem Update die alte Oberfläche | Unten auf der Anmeldeseite steht die Version. Bei Versionen vor 1.7.1 die App einmal ganz schließen (vom unteren Rand wischen und wegschieben) bzw. in Safari neu laden. |
 | Seite lädt nicht | `pct enter <ID>`, dann `systemctl status haus-ki caddy` und `journalctl -u haus-ki -n 50` |
 | „Ollama antwortet nicht“ | Läuft der Ollama-Gast? Administration › Ollama-Server › Zugriff auf Ollama: Ist die Adresse von Haus-KI erlaubt? |
 | Mikrofon grau, keine App-Installation | Zertifikat (`/ca.crt`) auf dem Gerät installiert und vertraut? |
 | Microsoft-Anmeldung schlägt fehl | Umleitungs-URI exakt? Rolle zugewiesen? Clientschlüssel abgelaufen? |
 | KNX antwortet nicht | Freie Tunnelverbindung an der Schnittstelle? Bei KNX Secure: Keyring und Passwort |
-| Postfach lässt sich nicht verbinden | IMAP eingeschaltet? App-Passwort statt normalem Passwort? |
+| Postfach lässt sich nicht verbinden | Meine Konten zeigt den Grund direkt an. GMX/WEB.DE: IMAP-Abruf im Postfach erlauben. Gmail, iCloud, Yahoo: App-Passwort. T-Online: eigenes E-Mail-Passwort. Mit „Testen“ lässt sich jedes Postfach jederzeit prüfen. |
 | Sprache oder Suche nach Bedeutung fehlen | Administration › Sprache bzw. Antwortqualität: Sind die Modelle geladen? |
 
 ## Entwicklung
@@ -160,12 +165,17 @@ passende `.sha256`. Beides als Release auf GitHub hochladen. Persönliche Vorgab
 cd app
 pip install -r requirements.txt pytest
 HAUSKI_DEV=1 python3 -m pytest -q tests
+# Postfach-Tests gegen einen echten IMAP-Server laufen mit, wenn Dovecot installiert ist (als root):
+#   apt install dovecot-imapd   (der Test startet und beendet seinen eigenen Server)
 HAUSKI_DEV=1 HAUSKI_DATA=/tmp/hk HAUSKI_SETUP_CODE=TEST HAUSKI_BASE_URL=http://localhost:8080 uvicorn hauski.main:app --port 8080
 ```
 
 - **Backend:** `app/hauski` (FastAPI, SQLite, eine Datei pro Thema, Werkzeuge für das Modell unter `tools/`).
 - **Oberfläche:** `app/static`, ohne Build-Schritt und ohne externe Bibliotheken. Die Dateien werden in fester Reihenfolge geladen
   (siehe `index.html`): `core`, `login`, `shell`, `knx`, `pages`, `chat`, `composer`, `commands`, `dialogs`, `voice`, `admin`.
+  Die Administration besteht aus dem Gerüst `admin.js` (Navigation, Formulare) und den Bereichen `admin-ki.js`,
+  `admin-quellen.js`, `admin-system.js` und `admin-menschen.js`. Wiederkehrende Abstände und Ausrichtungen stehen als
+  Hilfsklassen (`u-m0`, `u-row`, `u-wrap`, `u-center`, `u-start`) in `app.css`, nicht mehr als Inline-Stile.
 - **Installation:** `install/` (Proxmox-Skript, Einrichtung im Container, Update-Skript, Agent).
 
 Änderungen bitte mit Tests. Neue Werkzeuge, die etwas verändern, müssen über eine Bestätigung laufen.

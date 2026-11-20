@@ -108,6 +108,7 @@ async function boot() {
   try { me = await api("GET", "/api/me", undefined, { quiet401: true }); } catch (e) { /* nicht angemeldet */ }
   if (!me) return renderLogin();
   S.me = me;
+  if (location.search.includes("angemeldet=")) history.replaceState(null, "", "/" + location.hash);  // Zeitstempel der Anmeldung nicht stehen lassen
   S.model = me.default_model;
   try { S.sources = new Set(JSON.parse(localStorage.getItem("hk.sources") || "null") || defaultSources()); } catch (e) { S.sources = new Set(defaultSources()); }
   for (const s of [...S.sources]) if (!me.features[s]) S.sources.delete(s);

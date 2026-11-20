@@ -38,6 +38,7 @@ DEFAULTS: dict = {
     "session.idle_hours": 8,
     "login.max_failed": 5,
     "login.lock_minutes": 15,
+    "login.local_min_length": 8,
     "schedules.max_per_user": 5,
     # Paperless
     "paperless.enabled": False,
@@ -62,6 +63,8 @@ DEFAULTS: dict = {
     "mail.allow_gmx": True,
     "mail.allow_gmail": True,
     "mail.allow_outlookcom": True,
+    "mail.allow_imap": True,
+    "mail.night_scan": True,  # nachts neue Mails auf Rechnungen und Fristen prüfen (nur auf dem Haus-KI-Server)  # WEB.DE, T-Online, iCloud, Yahoo und eigene Server mit Benutzername und Passwort
     "mail.drafts": True,
     # Internet
     "web.enabled": False,
@@ -207,7 +210,11 @@ def import_bootstrap() -> None:
         name = (person.get("name") or "").strip()
         if not name or db.row("SELECT id FROM users WHERE lower(name)=lower(?)", (name,)):
             continue
-        uid = users.create(name, "admin" if person.get("role") == "admin" else "member", email=person.get("email") or "")
+        # Anmeldeart darf vorgegeben werden, Passwörter nie (die Datei enthält keine Geheimnisse).
+        # Lokale Personen bekommen ihr Passwort danach in der Administration.
+        login = person.get("login") if person.get("login") in users.LOGIN_MODES else "m365"
+        uid = users.create(name, "admin" if person.get("role") == "admin" else "member", email=person.get("email") or "",
+                           login=login)
         perms = {k: person[k] for k in ("learn", "jellyfin_user", "paperless", "m365") if k in person}
         if perms:
             db.run("UPDATE users SET perms=? WHERE id=?", (json.dumps(perms), uid))

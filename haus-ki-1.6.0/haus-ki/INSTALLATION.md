@@ -108,6 +108,7 @@ nano install/haus-ki-personen.json
 | `jellyfin_user` | Jellyfin-Benutzername, damit „gesehen“ und Empfehlungen stimmen |
 | `learn` | Lernmodus für Kinder: erklärt Schritt für Schritt statt fertiger Lösungen |
 | `paperless` | `false`, wenn die Person keine Dokumente sehen soll |
+| `login` | Anmeldeart: `m365` (Standard), `local` (ohne Microsoft-Konto) oder `both`. Das Passwort für die lokale Anmeldung vergibst du danach in der Administration unter Benutzer, die Datei enthält keine Passwörter. |
 
 Beide Dateien enthalten keine Geheimnisse und gehören trotzdem nicht in ein öffentliches Repository. Die `.gitignore` schließt sie aus.
 
@@ -192,7 +193,8 @@ bereits eingerichtet, sofern sie im Skript angegeben wurden. Die Übersicht zeig
 ## 7. Microsoft 365 anbinden
 
 Für die Anmeldung der Familie, Kalender, Mail-Entwürfe, OneDrive und To Do. Ohne Microsoft 365 funktioniert Haus-KI
-auch, dann melden sich nur Administratoren mit dem Notfall-Passwort an.
+auch: Personen bekommen dann unter Administration › Benutzer die Anmeldeart „Lokal“ und ein Passwort, Administratoren
+haben zusätzlich den Notfall-Zugang (siehe „Anmeldung pro Person“ weiter unten).
 
 ### In Microsoft Entra (entra.microsoft.com)
 
@@ -218,6 +220,25 @@ Administration › Microsoft 365: Verzeichnis-ID (Tenant), Anwendungs-ID (Client
 „Verbindung testen“. Danach erscheint auf der Anmeldeseite „Mit Microsoft anmelden“.
 
 ---
+
+
+### Anmeldung pro Person: Microsoft 365, lokal oder beides
+
+Unter Administration › Benutzer legst du für jede Person fest, wie sie sich anmeldet:
+
+| Anmeldeart | Bedeutung |
+|---|---|
+| **Microsoft 365** | Nur über das Microsoft-Konto (Standard). Die Rolle kommt bei jeder Anmeldung aus Entra. |
+| **Lokal** | Nur mit Haus-KI-Passwort, ohne Microsoft-Konto. Kalender, Outlook, OneDrive und To Do stehen dann nicht zur Verfügung. Die Rolle legst du in Haus-KI fest. |
+| **Beides** | Microsoft oder Haus-KI-Passwort, zum Beispiel wenn Microsoft gerade nicht erreichbar ist. |
+
+- Das Passwort für die lokale Anmeldung vergibt ein Administrator (Mindestlänge unter „Für alle Benutzer“, Standard 8 Zeichen).
+  Jede Person kann es danach selbst unter „Einstellungen für mich“ ändern.
+- Auf der Anmeldeseite wählt man sich aus den Personen mit lokaler Anmeldung aus und gibt das Passwort ein.
+  Nach zu vielen Fehlversuchen wird die Person wie beim Notfall-Zugang vorübergehend gesperrt.
+- Wird die Anmeldeart geändert, enden laufende Sitzungen über den nicht mehr erlaubten Weg sofort.
+  Bei „Lokal“ wird außerdem die Verbindung zu Microsoft 365 getrennt.
+- Der **Notfall-Zugang** für Administratoren bleibt davon unabhängig und hat ein eigenes Passwort.
 
 ## 8. KNX anbinden
 
@@ -335,7 +356,7 @@ starten, prüfen, wieder löschen.
 | Mikrofon grau | Zertifikat installiert? Mikrofon im Browser für Haus-KI erlaubt? |
 | Microsoft-Anmeldung schlägt fehl | Umleitungs-URI exakt gleich? Rolle zugewiesen? Clientschlüssel abgelaufen? |
 | KNX antwortet nicht | Freie Tunnelverbindung? Bei KNX Secure: Keyring und Passwort |
-| Postfach lässt sich nicht verbinden | IMAP eingeschaltet? App-Passwort statt normalem Passwort? |
+| Postfach lässt sich nicht verbinden | Meine Konten zeigt den Grund direkt an. GMX/WEB.DE: IMAP-Abruf im Postfach erlauben. Gmail, iCloud, Yahoo: App-Passwort. T-Online: eigenes E-Mail-Passwort. Mit „Testen“ lässt sich jedes Postfach jederzeit prüfen. |
 | Spracherkennung oder Suche nach Bedeutung fehlen | Administration › Sprache bzw. Antwortqualität: Modelle geladen? Container mit 4 Kernen und 4 GB? |
 
 Hilft das alles nicht, bitte ein Issue auf GitHub eröffnen. Hilfreich sind die Haus-KI-Version und die Ausgabe des

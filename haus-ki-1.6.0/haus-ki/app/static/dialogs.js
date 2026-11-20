@@ -61,27 +61,7 @@ async function renderModal() {
         h("button", { class: "act", type: "button", style: { color: "var(--err)" }, onClick: async () => { await api("DELETE", "/api/memory/" + x.id); renderModal(); } }, "Löschen"))) :
         h("p", { class: "small muted" }, "Noch nichts gespeichert."))]));
   } else if (m === "accounts") {
-    const d = await api("GET", "/api/accounts");
-    const allowed = S.me.mail_allowed;
-    const LABEL = { gmx: "GMX", gmail: "Gmail", outlookcom: "Outlook.com" };
-    const kind = h("select", { class: "inp", "aria-label": "Anbieter" }, Object.keys(LABEL).filter((k) => allowed[k]).map((k) => h("option", { value: k }, LABEL[k])));
-    const addr = h("input", { class: "inp", type: "email", placeholder: "Adresse", "aria-label": "E-Mail-Adresse" });
-    const pw = h("input", { class: "inp", type: "password", placeholder: "App-Passwort", "aria-label": "App-Passwort" });
-    const help = h("p", { class: "tiny muted", style: { margin: 0 } });
-    const upd = () => { pw.classList.toggle("hidden", kind.value === "outlookcom"); help.textContent = { gmx: "Bei GMX unter Einstellungen › POP3/IMAP den IMAP-Zugriff einschalten. Mit Zwei-Faktor brauchst du ein App-Passwort.", gmail: "Bei Google unter Sicherheit › App-Passwörter ein Passwort für „Haus-KI“ erzeugen. Zwei-Faktor muss aktiv sein.", outlookcom: "Du wirst zu Microsoft weitergeleitet und meldest dich dort mit deinem privaten Konto an." }[kind.value] || ""; };
-    kind.addEventListener("change", upd); upd();
-    el.appendChild(modalFrame("Nur für " + S.me.name, "Meine Konten", [
-      h("div", { class: "list-row", style: { borderTop: 0 } }, h("span", { class: "logo" }, "M"), h("span", { class: "grow" }, h("b", null, "Microsoft 365"), h("div", { class: "tiny muted" }, d.m365.connected ? `${d.m365.email}, automatisch über deine Anmeldung` : "Nicht verbunden. Melde dich einmal mit Microsoft an.")),
-        d.m365.connected ? h("span", { class: "badge ok" }, "verbunden") : h("a", { class: "btn sec", href: "/auth/login" }, "Verbinden")),
-      d.accounts.map((a) => h("div", { class: "list-row" }, h("span", { class: "logo" }, LABEL[a.kind][0]),
-        h("span", { class: "grow" }, h("b", null, LABEL[a.kind]), h("div", { class: "tiny muted" }, a.address + (a.connected ? "" : " · Anmeldung nicht abgeschlossen"))),
-        h("div", { style: { width: "220px" } }, toggle("Entwürfe erlauben", a.drafts, async (v) => { await api("PATCH", "/api/accounts/" + a.id, { drafts: v }); renderModal(); })),
-        h("button", { class: "act", type: "button", style: { color: "var(--err)" }, onClick: async () => { if (await confirmDialog("Postfach entfernen?", a.address, "Entfernen")) { await api("DELETE", "/api/accounts/" + a.id); S.modal = "accounts"; renderModal(); } } }, "Entfernen"))),
-      Object.values(allowed).some(Boolean) ? h("div", { class: "panel", style: { padding: "14px" } }, h("b", null, "Postfach hinzufügen"), h("div", { class: "grid2", style: { gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))" } }, kind, addr, pw), help,
-        h("button", { class: "btn", type: "button", style: { alignSelf: "flex-start" }, onClick: async () => {
-          try { const r = await api("POST", "/api/accounts", { kind: kind.value, address: addr.value, password: pw.value }); if (r.redirect) location.href = r.redirect; else { toast("Postfach verbunden."); renderModal(); } }
-          catch (e) { toast(e.message, true); } } }, "Verbinden")) : null,
-      h("p", { class: "tiny muted", style: { margin: 0 } }, "Haus-KI liest nur den Posteingang, nie den Spam-Ordner. Senden ist nicht möglich, höchstens Entwürfe.")]));
+    el.appendChild(await accountsModal());
   } else if (m === "schedules") {
     const list = await api("GET", "/api/schedules");
     const DN = { Mo: "Montag", Di: "Dienstag", Mi: "Mittwoch", Do: "Donnerstag", Fr: "Freitag", Sa: "Samstag", So: "Sonntag" };
@@ -127,6 +107,7 @@ async function renderModal() {
       h("div", null, h("b", null, "Benachrichtigungen"),
         toggle("Wenn eine Antwort fertig ist", p.notify_done, (v) => set("notify_done", v), "Auch wenn Haus-KI im Hintergrund ist."),
         toggle("Neue Fristen aus Paperless", p.notify_deadlines, (v) => set("notify_deadlines", v)),
+        S.me.features.mail ? toggle("Rechnungen und Fristen aus meinen Postfächern", p.notify_mail, (v) => set("notify_mail", v), "Haus-KI prüft nachts neue Mails im Posteingang. Die Mails verlassen dabei nicht den Haus-KI-Server.") : null,
         toggle("Überschneidungen im Familienkalender", p.notify_calendar, (v) => set("notify_calendar", v)),
         toggle("Geplante Prompts sind fertig", p.notify_schedules, (v) => set("notify_schedules", v))),
       h("div", null, h("b", null, "Ansicht"), toggle("Einfache Ansicht", !!p.simple_ui, async (v) => { S.me.prefs = await api("PUT", "/api/me/prefs", { simple_ui: v }); renderAll(); },
@@ -141,10 +122,113 @@ async function renderModal() {
         }))) : null,
       h("div", null, h("b", null, "Einführung"), h("div", null, h("button", { class: "act", type: "button", style: { color: "var(--accent)", paddingLeft: 0 }, onClick: () => { S.modal = "intro"; S.introStep = 0; renderAll(); } }, "Einführung noch einmal zeigen"))),
       pushBox(),
+      passwordBox(),
       h("div", null, h("b", null, "Vorschläge"), toggle("Vorschläge aus meinen Chats", p.suggestions, (v) => set("suggestions", v), "Nachts liest Haus-KI deine letzten Fragen und schlägt neue vor. Nur du siehst sie.")),
       "Notification" in window && Notification.permission !== "granted" ? h("button", { class: "btn sec", type: "button", style: { alignSelf: "flex-start" }, onClick: () => Notification.requestPermission().then(() => renderModal()) }, "Benachrichtigungen im Browser erlauben") : null,
       !S.me.features.admin_read ? null : h("p", { class: "tiny muted", style: { margin: 0 } }, isAdmin() ? "Administratoren können die Chats aller lesen. Jede Einsicht steht im Protokoll." : `${S.me.family.filter((u) => u.role === "admin").map((u) => u.name).join(" und ")} können deine Chats lesen. Jede Einsicht steht im Protokoll.`)]));
   }
+}
+
+// ------------------------------------------------------------------ Meine Konten: weitere Postfächer
+// Anmeldung mit Benutzername und Passwort (IMAP), Outlook.com über Microsoft. Haus-KI prüft jede Anmeldung sofort.
+async function accountsModal() {
+  const d = await api("GET", "/api/accounts");
+  const prov = Object.fromEntries(d.providers.map((p) => [p.id, p]));
+  const f = S.accForm = S.accForm && prov[S.accForm.kind] ? S.accForm : { kind: (d.providers[0] || {}).id, address: "", username: "", host: "", port: 993, security: "ssl", adv: false };
+  const p = prov[f.kind];
+  const inp = (key, attrs) => h("input", Object.assign({ class: "inp", value: f[key] ?? "", onInput: (e) => { f[key] = attrs.type === "number" ? +e.target.value : e.target.value; } }, attrs));
+  const status = (a) => !a.connected ? h("span", { class: "tiny", style: { color: "var(--warn)" } }, a.oauth ? "Anmeldung bei Microsoft nicht abgeschlossen" : "Nicht verbunden")
+    : a.error ? h("span", { class: "tiny", style: { color: "var(--err)" }, role: "status" }, "Problem: " + a.error)
+    : h("span", { class: "tiny muted" }, "verbunden" + (a.checked ? " · zuletzt geprüft " + fmtDate(a.checked) : ""));
+  const serverFields = (o, key) => h("div", { class: "grid2", style: { gridTemplateColumns: "2fr 1fr" } },
+    h("label", { class: "f", for: key + "host" }, "IMAP-Server", h("input", { class: "inp", id: key + "host", value: o.host || "", placeholder: "imap.example.org", autocomplete: "off", onInput: (e) => { o.host = e.target.value; } })),
+    h("label", { class: "f", for: key + "port" }, "Port", h("input", { class: "inp", id: key + "port", type: "number", value: o.port || 993, onInput: (e) => { o.port = +e.target.value; } })),
+    h("div", { style: { gridColumn: "1 / -1" } }, h("div", { class: "small muted", style: { marginBottom: "6px" } }, "Verschlüsselung"),
+      seg([["ssl", "SSL/TLS (meist Port 993)"], ["starttls", "STARTTLS (meist Port 143)"]], o.security || "ssl", (v) => { o.security = v; o.port = v === "ssl" ? 993 : 143; renderModal(); }, "Verschlüsselung")));
+
+  const rows = d.accounts.map((a) => {
+    const editing = S.accEdit && S.accEdit.id === a.id ? S.accEdit : null;
+    const out = h("div", { class: "list-row", style: { flexWrap: "wrap" } }, h("span", { class: "logo" }, a.label[0]),
+      h("span", { class: "grow", style: { minWidth: "180px" } }, h("b", null, a.label), h("div", { class: "tiny muted" }, a.address + (a.username ? ` · Benutzer ${a.username}` : "") + (a.host ? ` · ${a.host}:${a.port}` : "")), status(a)),
+      h("div", { style: { width: "200px" } }, toggle("Entwürfe erlauben", a.drafts, async (v) => { await api("PATCH", "/api/accounts/" + a.id, { drafts: v }); renderModal(); })),
+      h("button", { class: "act", type: "button", onClick: async (e) => {
+        e.target.textContent = "Prüfe …"; e.target.disabled = true;
+        const r = await api("POST", `/api/accounts/${a.id}/test`).catch((err) => ({ ok: false, text: err.message }));
+        toast(r.text, !r.ok); renderModal(); } }, "Testen"),
+      a.oauth ? null : h("button", { class: "act", type: "button", "aria-expanded": editing ? "true" : "false", onClick: () => { S.accEdit = editing ? null : { id: a.id, username: a.username, host: a.host, port: a.port, security: a.security, password: "" }; renderModal(); } }, "Zugangsdaten ändern"),
+      h("button", { class: "act", type: "button", style: { color: "var(--err)" }, onClick: async () => { if (await confirmDialog("Postfach entfernen?", a.address, "Entfernen")) { await api("DELETE", "/api/accounts/" + a.id); S.modal = "accounts"; renderModal(); } } }, "Entfernen"));
+    if (!editing) return out;
+    const err = h("p", { class: "small", role: "alert", style: { color: "var(--err)", margin: 0 } });
+    const save = h("button", { class: "btn", type: "button", onClick: async () => {
+      err.textContent = ""; save.disabled = true; save.textContent = "Prüfe Anmeldung …";
+      const body = { username: editing.username || "" };
+      if (editing.password) body.password = editing.password;
+      if (a.host) Object.assign(body, { host: editing.host, port: editing.port, security: editing.security });
+      try { const r = await api("PATCH", "/api/accounts/" + a.id, body); S.accEdit = null; toast(r.text || "Gespeichert."); renderModal(); }
+      catch (e) { err.textContent = e.message; save.disabled = false; save.textContent = "Speichern und prüfen"; }
+    } }, "Speichern und prüfen");
+    return h("div", null, out, h("div", { class: "panel", style: { padding: "14px", margin: "4px 0 10px" } },
+      h("div", { class: "grid2" },
+        h("label", { class: "f", for: "ea_user" }, "Benutzername (leer = E-Mail-Adresse)", h("input", { class: "inp", id: "ea_user", value: editing.username || "", autocomplete: "off", onInput: (e) => { editing.username = e.target.value; } })),
+        h("label", { class: "f", for: "ea_pw" }, "Neues Passwort (leer = unverändert)", h("input", { class: "inp", id: "ea_pw", type: "password", autocomplete: "new-password", onInput: (e) => { editing.password = e.target.value; } }))),
+      a.host ? serverFields(editing, "ea_") : null,
+      h("p", { class: "tiny muted", style: { margin: 0 } }, "Haus-KI prüft die neuen Angaben, bevor sie gespeichert werden. Klappt die Anmeldung nicht, bleibt alles wie bisher."),
+      err, h("div", { style: { display: "flex", gap: "8px" } }, save, h("button", { class: "btn sec", type: "button", onClick: () => { S.accEdit = null; renderModal(); } }, "Abbrechen"))));
+  });
+
+  let addPanel = null;
+  if (p) {
+    const pw = h("input", { class: "inp", id: "na_pw", type: "password", autocomplete: "new-password", value: f.pw || "", onInput: (e) => { f.pw = e.target.value; } });
+    const err = h("p", { class: "small", role: "alert", style: { color: "var(--err)", margin: 0 } });
+    const go = h("button", { class: "btn", type: "button", style: { alignSelf: "flex-start" }, onClick: async () => {
+      err.textContent = ""; go.disabled = true; go.textContent = p.oauth ? "Weiter zu Microsoft …" : "Prüfe Anmeldung …";
+      try {
+        const r = await api("POST", "/api/accounts", { kind: f.kind, address: f.address.trim(), password: pw.value, username: f.username.trim(), host: f.host.trim(), port: +f.port || 993, security: f.security });
+        if (r.redirect) { location.href = r.redirect; return; }
+        S.accForm = null; toast(r.text ? "Postfach verbunden. " + r.text : "Postfach verbunden."); renderModal();
+      } catch (e) { err.textContent = e.message; go.disabled = false; go.textContent = "Verbinden"; }
+    } }, "Verbinden");
+    pw.addEventListener("keydown", (e) => { if (e.key === "Enter") go.click(); });
+    addPanel = h("div", { class: "panel", style: { padding: "14px" } }, h("b", null, "Postfach hinzufügen"),
+      h("label", { class: "f", for: "na_kind" }, "Anbieter", h("select", { class: "inp", id: "na_kind", onChange: (e) => { f.kind = e.target.value; renderModal(); } },
+        d.providers.map((x) => h("option", { value: x.id, selected: x.id === f.kind }, x.label)))),
+      h("p", { class: "tiny muted", style: { margin: 0 } }, p.help),
+      h("label", { class: "f", for: "na_addr" }, "E-Mail-Adresse", inp("address", { id: "na_addr", type: "email", autocomplete: "off", placeholder: "name@example.de" })),
+      p.oauth ? null : h("label", { class: "f", for: "na_pw" }, "Passwort", pw),
+      p.custom ? serverFields(f, "na_") : null,
+      p.oauth ? null : h("details", { open: f.adv || f.username ? true : null, onToggle: (e) => { f.adv = e.target.open; } },
+        h("summary", { class: "small", style: { cursor: "pointer", minHeight: "32px" } }, "Benutzername weicht von der E-Mail-Adresse ab"),
+        h("label", { class: "f", for: "na_user", style: { paddingTop: "6px" } }, "Benutzername", inp("username", { id: "na_user", autocomplete: "off", placeholder: "nur ausfüllen, wenn dein Anbieter das verlangt" }))),
+      err, go);
+  }
+
+  return modalFrame("Nur für " + S.me.name, "Meine Konten", [
+    !d.m365.allowed ? null : h("div", { class: "list-row", style: { borderTop: 0 } }, h("span", { class: "logo" }, "M"), h("span", { class: "grow" }, h("b", null, "Microsoft 365"), h("div", { class: "tiny muted" }, d.m365.connected ? `${d.m365.email}, automatisch über deine Anmeldung` : "Nicht verbunden. Melde dich einmal mit Microsoft an.")),
+      d.m365.connected ? h("span", { class: "badge ok" }, "verbunden") : h("a", { class: "btn sec", href: "/auth/login" }, "Verbinden")),
+    rows, addPanel,
+    h("p", { class: "tiny muted", style: { margin: 0 } }, "Passwörter liegen verschlüsselt auf dem Haus-KI-Server und werden nur für die Anmeldung beim Anbieter verwendet. Haus-KI liest nur den Posteingang, nie den Spam-Ordner. Senden ist nicht möglich, höchstens Entwürfe.")]);
+}
+
+// Eigenes Passwort für die lokale Anmeldung ändern (nur, wenn die Person sich lokal anmelden darf)
+function passwordBox() {
+  if (!S.me || S.me.login === "m365" || !S.me.has_local_password) return null;
+  const cur = h("input", { class: "inp", id: "pw_cur", type: "password", autocomplete: "current-password" });
+  const n1 = h("input", { class: "inp", id: "pw_new1", type: "password", autocomplete: "new-password" });
+  const n2 = h("input", { class: "inp", id: "pw_new2", type: "password", autocomplete: "new-password" });
+  const err = h("p", { class: "small", role: "alert", style: { color: "var(--err)", margin: 0 } });
+  const btn = h("button", { class: "btn sec", type: "button", style: { alignSelf: "flex-start" }, onClick: async () => {
+    err.textContent = "";
+    if (!n1.value) { err.textContent = "Bitte ein neues Passwort eingeben."; return; }
+    if (n1.value !== n2.value) { err.textContent = "Die neuen Passwörter stimmen nicht überein."; return; }
+    btn.disabled = true;
+    try { await api("PUT", "/api/me/password", { current: cur.value, new: n1.value }); cur.value = n1.value = n2.value = ""; toast("Passwort geändert."); }
+    catch (e) { err.textContent = e.message; }
+    btn.disabled = false;
+  } }, "Passwort ändern");
+  return h("div", { style: { display: "flex", flexDirection: "column", gap: "8px" } }, h("b", null, "Passwort für die Anmeldung ohne Microsoft"),
+    h("label", { class: "f", for: "pw_cur" }, "Bisheriges Passwort", cur),
+    h("div", { class: "grid2" }, h("label", { class: "f", for: "pw_new1" }, "Neues Passwort", n1), h("label", { class: "f", for: "pw_new2" }, "Neues Passwort wiederholen", n2)),
+    err, btn);
 }
 
 // ------------------------------------------------------------------ Einführung beim ersten Anmelden

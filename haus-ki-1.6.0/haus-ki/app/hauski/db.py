@@ -115,6 +115,16 @@ SCHEMA = [
     """
     ALTER TABLE actions ADD COLUMN via TEXT;
     """,
+    # Version 6: Anmeldung pro Person (Microsoft 365, lokal oder beides) mit eigenem lokalen Passwort.
+    # Das Notfall-Passwort (pw_hash) bleibt davon getrennt.
+    """
+    ALTER TABLE users ADD COLUMN login TEXT NOT NULL DEFAULT 'm365';
+    ALTER TABLE users ADD COLUMN local_pw TEXT;
+    """,
+    # Version 7: Postfächer mit eigenem Benutzernamen, Server, Port und letztem Verbindungsstatus
+    """
+    ALTER TABLE accounts ADD COLUMN config TEXT NOT NULL DEFAULT '{}';
+    """,
 ]
 
 _local = threading.local()

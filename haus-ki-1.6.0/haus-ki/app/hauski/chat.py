@@ -66,7 +66,7 @@ def allowed_sources(user: dict, requested: list[str]) -> set[str]:
         "paperless": settings.get("paperless.enabled") and p.get("paperless"),
         "jellyfin": settings.get("jellyfin.enabled") and p.get("jellyfin"),
         "knx": settings.get("knx.enabled") and p.get("knx"),
-        "m365": settings.get("ms.enabled") and p.get("m365"),
+        "m365": settings.get("ms.enabled") and p.get("m365") and users.allows_m365(user),
         "mail": p.get("mail"),
         "web": settings.get("web.enabled") and p.get("web"),
     }

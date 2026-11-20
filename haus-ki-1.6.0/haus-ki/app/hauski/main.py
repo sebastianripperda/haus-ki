@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, db, scheduler, settings, tools
@@ -50,8 +50,19 @@ async def headers(request: Request, call_next):
     resp.headers["Content-Security-Policy"] = CSP
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "same-origin"
-    if request.url.path.startswith("/api/"):
+    path = request.url.path
+    if path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
+    elif path.startswith("/static/") and resp.status_code == 200:
+        # Ohne Angabe raten Browser (vor allem Safari auf iPhone und iPad) selbst, wie lange eine Datei gilt,
+        # und benutzen nach einem Update tagelang alte Skripte. Mit Versionsnummer gilt die Datei dauerhaft,
+        # ohne Versionsnummer wird jedes Mal kurz nachgefragt (304, wenn unverändert).
+        if request.query_params.get("v") == __version__:
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path.startswith(("/static/fonts/", "/static/icons/")):
+            resp.headers["Cache-Control"] = "public, max-age=604800"
+        else:
+            resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
@@ -90,11 +101,16 @@ def manifest():
                         headers={"Cache-Control": "no-cache"})
 
 
+def _versioned(name: str) -> str:
+    """Datei aus static mit eingesetzter Versionsnummer (für Cache-Busting nach Updates)."""
+    return (config.static_dir / name).read_text(encoding="utf-8").replace("__HK_VERSION__", __version__)
+
+
 @app.get("/sw.js")
 def service_worker():
     # Vom Wurzelpfad ausgeliefert, damit der Service Worker die ganze App abdeckt
-    return FileResponse(config.static_dir / "sw.js", media_type="text/javascript",
-                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+    return Response(_versioned("sw.js"), media_type="text/javascript",
+                    headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
 
 
 @app.get("/ca.crt")
@@ -112,4 +128,4 @@ app.mount("/static", StaticFiles(directory=config.static_dir), name="static")
 def spa(path: str):
     if path.startswith(("api/", "auth/")):
         return JSONResponse({"detail": "Nicht gefunden."}, status_code=404)
-    return FileResponse(config.static_dir / "index.html", headers={"Cache-Control": "no-cache"})
+    return HTMLResponse(_versioned("index.html"), headers={"Cache-Control": "no-cache"})

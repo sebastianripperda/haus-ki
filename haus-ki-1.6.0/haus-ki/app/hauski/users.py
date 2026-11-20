@@ -10,6 +10,37 @@ MEMBER_PERMS = {"paperless": False, "jellyfin": True, "knx": True, "knx_rooms": 
                 "mail": True, "web": True, "memory": True, "voice": True, "auto_actions": True, "learn": False, "jellyfin_user": ""}
 
 
+# Anmeldearten pro Person: nur Microsoft 365, nur lokal (Haus-KI-Passwort) oder beides.
+LOGIN_MODES = ("m365", "local", "both")
+LOGIN_LABELS = {"m365": "Microsoft 365", "local": "Lokal", "both": "Microsoft 365 und lokal"}
+
+
+def login_mode(user: dict) -> str:
+    m = user.get("login") or "m365"
+    return m if m in LOGIN_MODES else "m365"
+
+
+def allows_m365(user: dict) -> bool:
+    return login_mode(user) in ("m365", "both")
+
+
+def allows_local(user: dict) -> bool:
+    return login_mode(user) in ("local", "both")
+
+
+def check_local_password(password: str) -> None:
+    """Mindestlänge für lokale Passwörter (Administration › Benutzer › Für alle Benutzer)."""
+    from . import settings
+    n = int(settings.get("login.local_min_length") or 8)
+    if len(password or "") < n:
+        raise ValueError(f"Das Passwort braucht mindestens {n} Zeichen.")
+
+
+def set_local_password(user_id: int, password: str | None) -> None:
+    db.run("UPDATE users SET local_pw=?, failed_logins=0, locked_until=0 WHERE id=?",
+           (security.hash_password(password) if password else None, user_id))
+
+
 def perms(user: dict) -> dict:
     base = dict(ADMIN_PERMS if user["role"] == "admin" else MEMBER_PERMS)
     base.update(db.jload(user.get("perms"), {}) or {})
@@ -27,6 +58,7 @@ def public(user: dict, full: bool = False) -> dict:
         out.update({"email": user["email"], "oid": user["oid"], "perms": perms(user),
                     "prefs": db.jload(user.get("prefs"), {}) or {}, "disabled": bool(user["disabled"]),
                     "has_password": bool(user["pw_hash"]),
+                    "login": login_mode(user), "has_local_password": bool(user.get("local_pw")),
                     "paperless_token": bool(personal_secret(user["id"], "paperless_token"))})
     return out
 
@@ -35,12 +67,15 @@ def get(user_id: int) -> dict | None:
     return db.row("SELECT * FROM users WHERE id=?", (user_id,))
 
 
-def create(name: str, role: str, email: str = "", oid: str | None = None, password: str | None = None) -> int:
+def create(name: str, role: str, email: str = "", oid: str | None = None, password: str | None = None,
+           login: str = "m365", local_password: str | None = None) -> int:
     n = db.scalar("SELECT COUNT(*) FROM users") or 0
     return db.run(
-        "INSERT INTO users(name,email,oid,role,color,pw_hash,created) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO users(name,email,oid,role,color,pw_hash,login,local_pw,created) VALUES(?,?,?,?,?,?,?,?,?)",
         (name, email, oid, role, COLORS[n % len(COLORS)],
-         security.hash_password(password) if password else None, db.now()))
+         security.hash_password(password) if password else None,
+         login if login in LOGIN_MODES else "m365",
+         security.hash_password(local_password) if local_password else None, db.now()))
 
 
 def personal_secret(user_id: int, kind: str) -> str:
@@ -57,7 +92,7 @@ def set_personal_secret(user_id: int, kind: str, value: str) -> None:
 
 def prefs(user: dict) -> dict:
     p = {"notify_done": True, "suggestions": True, "notify_deadlines": True, "notify_calendar": True,
-         "notify_schedules": True, "voice": "", "voice_speed": "normal", "voice_auto_send": False, "voice_read_talk": True,
+         "notify_schedules": True, "notify_mail": True, "voice": "", "voice_speed": "normal", "voice_auto_send": False, "voice_read_talk": True,
          "simple_ui": user.get("role") != "admin",  # Mitglieder starten mit der einfachen Ansicht
          "auto_actions": [], "onboarded": False}
     p.update(db.jload(user.get("prefs"), {}) or {})

@@ -23,6 +23,7 @@ SCRIPT = textwrap.dedent("""
         assert rows["Anna"]["pw_hash"] and rows["Anna"]["role"] == "admin"
         assert users.perms(rows["Mia"])["learn"] is True and rows["Mia"]["role"] == "member"
         assert users.perms(rows["Leo"])["jellyfin_user"] == "leo"
+        assert rows["Leo"]["login"] == "local" and rows["Mia"]["login"] == "m365" and rows["Leo"]["local_pw"] is None
         assert c.get("/api/setup/status").json()["needs_setup"] is False
         assert c.post("/api/setup", json={"code": "C-1", "name": "x", "password": "y" * 12}).status_code == 409
     print("OK")

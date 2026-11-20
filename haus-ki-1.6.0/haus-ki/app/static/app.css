@@ -250,6 +250,7 @@ table.t td{padding:6px 8px;border-bottom:1px solid var(--row);vertical-align:mid
   button,select,[role="tab"],a.menu-row,.btn{min-height:44px}
   .ib,.act,.send{min-width:44px;min-height:44px}
   .inp{min-height:44px}
+  input.inp,select.inp,textarea.inp{font-size:16px}
 }
 
 /* Zahlen und Uhrzeiten in Monospace, wie in der Vorlage */
@@ -313,3 +314,16 @@ table.t td{padding:6px 8px;border-bottom:1px solid var(--row);vertical-align:mid
 .intro-dots{display:inline-flex;gap:6px}
 .intro-dots span{width:8px;height:8px;border-radius:50%;background:var(--line2)}
 .intro-dots span.on{background:var(--accent)}
+/* Lokale Anmeldung: Personen wählen */
+.login-people{display:flex;gap:8px;flex-wrap:wrap}
+.login-person{display:flex;flex-direction:column;align-items:center;gap:4px;min-width:76px;padding:8px 6px;border:1px solid transparent;border-radius:var(--r);background:none;color:var(--text);font:inherit;font-size:13px;cursor:pointer}
+.login-person:hover{background:var(--hover)}
+.login-person[aria-checked="true"]{border-color:var(--primary);background:var(--fill);font-weight:600}
+.login-or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px}
+.login-or::before,.login-or::after{content:"";flex:1;border-top:1px solid var(--line)}
+/* Layout-Hilfsklassen für die Administration (ersetzen wiederkehrende Inline-Stile, daher mit Vorrang wie diese) */
+.u-m0{margin:0!important}
+.u-start{align-self:flex-start!important}
+.u-row{display:flex!important;gap:8px!important}
+.u-wrap{flex-wrap:wrap!important}
+.u-center{align-items:center!important}

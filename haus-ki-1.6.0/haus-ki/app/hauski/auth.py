@@ -1,4 +1,4 @@
-"""Anmeldung: Microsoft Entra ID (OIDC mit PKCE), Notfall-Zugang und Ersteinrichtung."""
+"""Anmeldung: Microsoft Entra ID (OIDC mit PKCE), lokale Anmeldung, Notfall-Zugang und Ersteinrichtung."""
 import base64
 import hashlib
 import time
@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
-from . import db, security, settings, users
+from . import __version__, db, security, settings, users
 from .config import config
 from .events import audit
 
@@ -90,9 +90,14 @@ def setup_done() -> bool:
 @router.get("/api/setup/status")
 def setup_status():
     n = db.scalar("SELECT COUNT(*) FROM users") or 0
-    return {"needs_setup": not setup_done(), "sso": sso_ready(),
-            "recent": [users.public(u) | {"emergency": bool(u["pw_hash"])} for u in db.rows(
-                "SELECT * FROM users WHERE disabled=0 ORDER BY id LIMIT 8")] if n else []}
+    active = db.rows("SELECT * FROM users WHERE disabled=0 ORDER BY id") if n else []
+    return {"needs_setup": not setup_done(), "sso": sso_ready(), "version": __version__,
+            # Schnellwahl für die Microsoft-Anmeldung: nur Personen, die Microsoft verwenden dürfen
+            "recent": [users.public(u) | {"emergency": bool(u["pw_hash"])} for u in active if users.allows_m365(u)][:8],
+            # Lokale Anmeldung: Personen mit lokaler Anmeldung und gesetztem Passwort
+            "local": [users.public(u) for u in active if users.allows_local(u) and u["local_pw"]],
+            # Notfall-Zugang: Administratoren mit Notfall-Passwort, unabhängig von der Anmeldeart
+            "emergency": [users.public(u) for u in active if u["role"] == "admin" and u["pw_hash"]]}
 
 
 @router.post("/api/setup")
@@ -117,29 +122,47 @@ def setup(body: SetupIn, request: Request, response: Response):
     return {"ok": True}
 
 
-# ---------------------------------------------------------------- Notfall-Zugang
-class EmergencyIn(BaseModel):
+# ---------------------------------------------------------------- Passwort-Anmeldungen
+class PasswordLoginIn(BaseModel):
     user_id: int
     password: str
 
 
-@router.post("/auth/emergency")
-def emergency(body: EmergencyIn, request: Request, response: Response):
-    user = users.get(body.user_id)
+EmergencyIn = PasswordLoginIn  # Name aus älteren Versionen
+
+
+def _password_login(user: dict | None, allowed: bool, stored: str | None, password: str, label: str) -> dict:
+    """Gemeinsame Prüfung für Notfall-Zugang und lokale Anmeldung: gleiche Laufzeit, Sperre nach Fehlversuchen."""
     generic = HTTPException(401, "Name oder Passwort stimmt nicht.")
-    if not user or user["disabled"] or user["role"] != "admin":
-        security.verify_password(body.password, None)
+    if not user or user["disabled"] or not allowed or not stored:
+        security.verify_password(password, None)
         raise generic
     if user["locked_until"] > db.now():
         mins = int((user["locked_until"] - db.now()) / 60) + 1
         raise HTTPException(429, f"Zu viele Fehlversuche. Versuche es in {mins} Minuten erneut.")
-    if not security.verify_password(body.password, user["pw_hash"]):
+    if not security.verify_password(password, stored):
         failed = user["failed_logins"] + 1
         lock = db.now() + settings.get("login.lock_minutes") * 60 if failed >= settings.get("login.max_failed") else 0
         db.run("UPDATE users SET failed_logins=?, locked_until=? WHERE id=?", (failed if not lock else 0, lock, user["id"]))
-        audit(user["name"], "Anmeldung", "Notfall-Zugang: falsches Passwort" + (", Konto vorübergehend gesperrt" if lock else ""))
+        audit(user["name"], "Anmeldung", f"{label}: falsches Passwort" + (", Konto vorübergehend gesperrt" if lock else ""))
         raise generic
+    return user
+
+
+@router.post("/auth/emergency")
+def emergency(body: PasswordLoginIn, request: Request, response: Response):
+    user = users.get(body.user_id)
+    _password_login(user, bool(user and user["role"] == "admin"), user and user["pw_hash"], body.password, "Notfall-Zugang")
     start_session(response, request, user, "Notfall-Zugang")
+    return {"ok": True}
+
+
+@router.post("/auth/local")
+def local_login(body: PasswordLoginIn, request: Request, response: Response):
+    """Anmeldung ohne Microsoft-Konto, nur für Personen mit Anmeldeart „lokal“ oder „beides“."""
+    user = users.get(body.user_id)
+    _password_login(user, bool(user and users.allows_local(user)), user and user["local_pw"], body.password, "Lokale Anmeldung")
+    start_session(response, request, user, "Lokal")
     return {"ok": True}
 
 
@@ -255,22 +278,57 @@ async def callback(request: Request, code: str = "", state: str = "", error: str
     if not user:
         # Ein vorhandenes Konto ohne Microsoft-Verknüpfung (z. B. Notfall-Admin) per E-Mail verknüpfen.
         user = db.row("SELECT * FROM users WHERE oid IS NULL AND lower(email)=lower(?)", (email,)) if email else None
-        if user:
+        # Personen mit Anmeldeart „nur lokal“ werden nicht verknüpft, sondern unten abgewiesen.
+        if user and users.allows_m365(user):
             db.run("UPDATE users SET oid=? WHERE id=?", (oid, user["id"]))
-        else:
+        elif not user:
             uid = users.create(name.split(" ")[0] if name else email, role, email=email, oid=oid)
             user = users.get(uid)
             audit(user["name"], "Anmeldung", f"Konto beim ersten Microsoft-Login angelegt ({role})")
     if user["disabled"]:
         return RedirectResponse("/?fehler=gesperrt")
+    if not users.allows_m365(user):
+        audit(user["name"], "Anmeldung", "Microsoft-Anmeldung abgewiesen: für diese Person nur lokale Anmeldung erlaubt")
+        return RedirectResponse("/?fehler=nur-lokal")
     if user["role"] != role:
         db.run("UPDATE users SET role=? WHERE id=?", (role, user["id"]))
         audit(user["name"], "Einstellung", f"Rolle aus Entra übernommen: {role}")
     db.run("UPDATE users SET email=? WHERE id=?", (email, user["id"]))
     store_tokens(user["id"], "graph", tok)
-    resp = RedirectResponse("/")
+    # Mit Zeitstempel zurück: kommt die App danach ohne Sitzung an, ist das Anmelde-Cookie unterwegs verloren gegangen
+    # (typisch für die App auf dem iPhone-Home-Bildschirm). Die Anmeldeseite erklärt das dann und meldet es fürs Protokoll.
+    now = int(time.time())
+    db.kv_set(f"cb:{_client_ip(request)}", {"t": now, "user": user["name"]})
+    resp = RedirectResponse(f"/?angemeldet={now}")
     start_session(resp, request, users.get(user["id"]), "Microsoft")
     return resp
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+class LostIn(BaseModel):
+    standalone: bool = False
+
+
+@router.post("/auth/lost-session")
+def lost_session(body: LostIn, request: Request):
+    """Die Anmeldeseite meldet: Microsoft-Anmeldung war erfolgreich, die Sitzung kam aber nicht an.
+
+    Ohne Anmeldung erreichbar, schreibt aber nur, wenn dieses Gerät in den letzten 10 Minuten eine Microsoft-Anmeldung
+    abgeschlossen hat, und nur einmal pro Anmeldung. So lässt sich das Protokoll nicht von außen füllen.
+    """
+    key = f"cb:{_client_ip(request)}"
+    cb = db.kv_get(key)
+    if not cb or time.time() - cb.get("t", 0) > 600:
+        return {"ok": False}
+    db.run("DELETE FROM kv WHERE key=?", (key,))
+    ua = request.headers.get("user-agent", "")
+    device = "iPhone/iPad" if any(x in ua for x in ("iPhone", "iPad")) else "Gerät"
+    audit(cb.get("user", "?"), "Anmeldung", f"Microsoft-Anmeldung erfolgreich, aber die Sitzung kam nicht an ({device}"
+          + (", App vom Home-Bildschirm" if body.standalone else ", Browser") + ")")
+    return {"ok": True}
 
 
 async def access_token(user_id: int, audience: str = "graph") -> str:

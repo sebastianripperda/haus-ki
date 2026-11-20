@@ -622,3 +622,358 @@ def test_model_comparison(client):
     assert res["done"] == 6 and [m["model"] for m in res["models"]] == ["qwen3:8b", "llama3.2:3b"]
     assert all(m["answers"] == 6 for m in res["models"])
     assert db.scalar("SELECT COUNT(*) FROM chats WHERE kind='eval' AND title LIKE 'Vergleich:%'") >= 6
+
+
+# ------------------------------------------------------------ Anmeldung: Microsoft 365, lokal oder beides
+def _fresh():
+    c = TestClient(app)
+    c.headers["x-haus-ki"] = "1"
+    return c
+
+
+def _uid(name):
+    return db.scalar("SELECT id FROM users WHERE name=?", (name,))
+
+
+def test_admin_creates_local_user_and_login_modes(client):
+    # Ohne Passwort keine lokale Anmeldung, zu kurze Passwörter werden abgelehnt
+    assert client.post("/api/admin/users", json={"name": "Lina", "login": "local"}).status_code == 400
+    assert client.post("/api/admin/users", json={"name": "Lina", "login": "local", "local_password": "kurz"}).status_code == 400
+    assert client.post("/api/admin/users", json={"name": "Lina", "login": "quatsch", "local_password": "lang-genug-1"}).status_code == 400
+    r = client.post("/api/admin/users", json={"name": "Lina", "login": "local", "local_password": "lina-pass-1"})
+    assert r.status_code == 200, r.text
+    lina = r.json()["id"]
+    assert client.post("/api/admin/users", json={"name": "lina"}).status_code == 400  # Name doppelt
+    tom = client.post("/api/admin/users", json={"name": "Tom", "email": "tom@example.org"}).json()["id"]  # Standard: Microsoft 365
+
+    st = client.get("/api/setup/status").json()
+    assert lina in [u["id"] for u in st["local"]] and tom not in [u["id"] for u in st["local"]]
+    assert lina not in [u["id"] for u in st["recent"]]
+    users_ = {u["id"]: u for u in client.get("/api/admin/users").json()}
+    assert users_[lina]["login"] == "local" and users_[lina]["has_local_password"] and not users_[lina]["has_password"]
+    assert "lina-pass-1" not in (db.row("SELECT local_pw FROM users WHERE id=?", (lina,))["local_pw"] or "")
+
+    c = _fresh()
+    assert c.post("/auth/local", json={"user_id": lina, "password": "falsch-falsch"}).status_code == 401
+    assert c.post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 200
+    me = c.get("/api/me").json()
+    assert me["name"] == "Lina" and me["login"] == "local" and me["features"]["m365"] is False
+    assert db.row("SELECT method FROM sessions WHERE user_id=? ORDER BY created DESC", (lina,))["method"] == "Lokal"
+    # Nur-Microsoft-Personen können sich nicht lokal anmelden, auch nicht mit dem Notfall-Passwort eines Admins
+    assert _fresh().post("/auth/local", json={"user_id": tom, "password": "irgendwas-1"}).status_code == 401
+    assert _fresh().post("/auth/local", json={"user_id": 1, "password": "sehr-geheim-123"}).status_code == 401
+    # Lokales Passwort ist kein Notfall-Passwort
+    client.put(f"/api/admin/users/{lina}", json={"role": "admin"})
+    assert _fresh().post("/auth/emergency", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 401
+    client.put(f"/api/admin/users/{lina}", json={"role": "member"})
+
+
+def test_switching_login_mode_ends_sessions(client):
+    lina = _uid("Lina")
+    c = _fresh()
+    assert c.post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 200
+    assert c.get("/api/me").status_code == 200
+    r = client.put(f"/api/admin/users/{lina}", json={"login": "m365"})
+    assert r.status_code == 200, r.text
+    assert c.get("/api/me").status_code == 401
+    assert _fresh().post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 401
+    # Zurück auf „beides“: das gespeicherte Passwort gilt wieder
+    assert client.put(f"/api/admin/users/{lina}", json={"login": "both"}).status_code == 200
+    assert _fresh().post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 200
+    # Lokales Passwort entfernen geht nur bei „nur Microsoft 365“
+    assert client.put(f"/api/admin/users/{lina}", json={"remove_local_password": True}).status_code == 400
+    tom = _uid("Tom")
+    assert client.put(f"/api/admin/users/{tom}", json={"login": "both"}).status_code == 400  # erst Passwort vergeben
+    assert client.put(f"/api/admin/users/{tom}", json={"login": "both", "local_password": "tom-pass-12"}).status_code == 200
+    assert client.put(f"/api/admin/users/{tom}", json={"login": "m365", "remove_local_password": True}).status_code == 200
+    assert db.row("SELECT local_pw, login FROM users WHERE id=?", (tom,)) == {"local_pw": None, "login": "m365"}
+    assert db.scalar("SELECT COUNT(*) FROM audit WHERE text LIKE '%Anmeldung: Lokal%' OR text LIKE '%Anmeldung: Microsoft 365%'") >= 2
+
+
+def test_user_changes_own_password(client):
+    lina = _uid("Lina")
+    c = _fresh()
+    assert c.post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 200
+    other = _fresh()
+    assert other.post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 200
+    assert c.put("/api/me/password", json={"current": "falsch-123", "new": "neu-pass-22"}).status_code == 400
+    assert c.put("/api/me/password", json={"current": "lina-pass-1", "new": "kurz"}).status_code == 400
+    assert c.put("/api/me/password", json={"current": "lina-pass-1", "new": "neu-pass-22"}).status_code == 200
+    assert c.get("/api/me").status_code == 200          # eigene Sitzung bleibt
+    assert other.get("/api/me").status_code == 401      # andere lokale Sitzungen enden
+    assert _fresh().post("/auth/local", json={"user_id": lina, "password": "lina-pass-1"}).status_code == 401
+    assert _fresh().post("/auth/local", json={"user_id": lina, "password": "neu-pass-22"}).status_code == 200
+    # Wer nur Microsoft verwendet, hat kein lokales Passwort zum Ändern
+    assert client.put("/api/me/password", json={"current": "x", "new": "neu-pass-22"}).status_code == 400
+
+
+def test_local_login_lockout(client):
+    lina = _uid("Lina")
+    for _ in range(5):
+        _fresh().post("/auth/local", json={"user_id": lina, "password": "falsch-falsch"})
+    assert _fresh().post("/auth/local", json={"user_id": lina, "password": "neu-pass-22"}).status_code == 429
+    client.put(f"/api/admin/users/{lina}", json={"unlock": True})
+    assert _fresh().post("/auth/local", json={"user_id": lina, "password": "neu-pass-22"}).status_code == 200
+
+
+def test_microsoft_login_rejected_for_local_only(client, monkeypatch):
+    from hauski import auth
+    lina = _uid("Lina")
+    client.put(f"/api/admin/users/{lina}", json={"login": "local", "email": "lina@example.org"})
+
+    async def fake_exchange(code, verifier, tenant=None):
+        return {"id_token": "x", "access_token": "a", "refresh_token": "r", "expires_in": 3600}
+    claims = {"roles": ["HausKI.Member"], "oid": "oid-lina", "name": "Lina Muster", "email": "lina@example.org", "nonce": "n"}
+    monkeypatch.setattr(auth, "exchange", fake_exchange)
+    monkeypatch.setattr(auth, "validate_id_token", lambda tok, nonce: claims)
+
+    def login_ms(state):
+        db.kv_set(f"oidc:{state}", {"v": "v", "n": "n", "p": "login", "t": __import__("time").time(), "tenant": None})
+        return _fresh().get(f"/auth/callback?code=c&state={state}", follow_redirects=False)
+
+    r = login_ms("s1")
+    assert r.status_code in (302, 307) and "fehler=nur-lokal" in r.headers["location"]
+    assert db.row("SELECT oid FROM users WHERE id=?", (lina,))["oid"] is None  # nicht verknüpft
+    assert not db.row("SELECT 1 FROM ms_tokens WHERE user_id=?", (lina,))
+    # Mit „beides“ klappt Microsoft und verknüpft das Konto
+    client.put(f"/api/admin/users/{lina}", json={"login": "both"})
+    r = login_ms("s2")
+    assert r.headers["location"].startswith("/?angemeldet=") and "hk_session" in r.headers.get("set-cookie", "")
+    assert db.row("SELECT oid FROM users WHERE id=?", (lina,))["oid"] == "oid-lina"
+    # Wieder auf „nur lokal“: Microsoft-Verbindung wird getrennt, Anmeldung abgewiesen
+    client.put(f"/api/admin/users/{lina}", json={"login": "local"})
+    assert not db.row("SELECT 1 FROM ms_tokens WHERE user_id=? AND audience='graph'", (lina,))
+    assert "fehler=nur-lokal" in login_ms("s3").headers["location"]
+
+
+def test_static_files_are_versioned_for_safari(client):
+    """Safari (iPhone/iPad) benutzt sonst nach Updates tagelang alte Skripte aus dem Cache."""
+    from hauski import __version__
+    html = client.get("/").text
+    assert f"/static/login.js?v={__version__}" in html and f"/static/app.css?v={__version__}" in html
+    assert "__HK_VERSION__" not in html and 'src="/static/core.js"' not in html
+    assert "immutable" in client.get(f"/static/login.js?v={__version__}").headers["cache-control"]
+    assert client.get("/static/login.js").headers["cache-control"] == "no-cache"
+    assert client.get("/static/login.js?v=0.0.1").headers["cache-control"] == "no-cache"  # alte Version: nicht festhalten
+    sw = client.get("/sw.js")
+    assert f'const V = "{__version__}"' in sw.text and sw.headers["cache-control"] == "no-cache"
+    assert client.get("/api/setup/status").json()["version"] == __version__
+
+
+# ------------------------------------------------------------ Weitere Postfächer (IMAP mit Benutzername und Passwort)
+class FakeIMAP:
+    """Nachbildung eines IMAP-Servers mit deutschen Ordnernamen und "." als Trennzeichen."""
+    caps = ("IMAP4REV1", "AUTH=PLAIN")
+    instances: list = []
+    error = __import__("imaplib").IMAP4.error  # bleibt erhalten, wenn imaplib.IMAP4 ersetzt wird
+
+    def __init__(self, host, port, ssl_context=None, timeout=None):
+        self.host, self.port, self.capabilities, self.log, self.literal = host, port, self.caps, [], None
+        FakeIMAP.instances.append(self)
+
+    def starttls(self, ssl_context=None):
+        self.log.append(("STARTTLS",))
+
+    def authenticate(self, mech, cb):
+        blob = cb(b"")
+        self.log.append(("AUTH", mech, blob))
+        if blob.split(b"\0")[2] != "Grüße-Straße€1".encode():
+            raise FakeIMAP.error("[AUTHENTICATIONFAILED] Authentication failed.")
+
+    def login(self, user, pw):
+        self.log.append(("LOGIN", user, pw))
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "." INBOX', b'(\\HasNoChildren \\Drafts) "." Entw&APw-rfe',
+                      b'(\\HasNoChildren \\Junk) "." Spam', b'(\\HasNoChildren \\All) "." "[Gmail].Alle Nachrichten"']
+
+    def select(self, box, readonly=False):
+        self.log.append(("SELECT", box))
+        return "OK", [b"2"]
+
+    def search(self, charset, *crit):
+        self.log.append(("SEARCH", charset, crit, self.literal))
+        return "OK", [b"1 2"]
+
+    def fetch(self, i, what):
+        return "OK", [(b"1 (BODY[] {10}", b"Subject: Rechnung " + i + b"\r\nFrom: a@b.de\r\n\r\nText")]
+
+    def uid(self, cmd, *args):
+        self.log.append(("UID", cmd) + args)
+        if cmd == "SEARCH":
+            return "OK", [b"1 2"]
+        uid, items = args[0], args[1]
+        head = b"Subject: Rechnung " + uid.encode() + b"\r\nFrom: a@b.de\r\nMessage-ID: <m" + uid.encode() + b"@x>\r\n\r\n"
+        meta = b"1 (UID " + uid.encode() + b' RFC822.SIZE 120 INTERNALDATE "13-Nov-2026 10:0' + uid.encode() + b':00 +0100"'
+        if "HEADER" in items:
+            return "OK", [(meta + b" BODY[HEADER] {%d}" % len(head), head), b")"]
+        if "TEXT" in items:
+            return "OK", [(b"1 (BODY[TEXT]<0> {12}", b"Telekom Text"), b")"]
+        return "OK", [(b"1 (BODY[] {%d}" % (len(head) + 4), head + b"Text"), b")"]
+
+    def append(self, box, flags, date, msg):
+        self.log.append(("APPEND", box, flags))
+        return "OK", [b""]
+
+    def enable(self, what):
+        self.log.append(("ENABLE", what))
+
+    def logout(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+@pytest.fixture()
+def fake_imap(monkeypatch):
+    import imaplib
+    FakeIMAP.instances.clear()
+    FakeIMAP.caps = ("IMAP4REV1", "AUTH=PLAIN")
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", FakeIMAP)
+    monkeypatch.setattr(imaplib, "IMAP4", FakeIMAP)
+    return FakeIMAP
+
+
+def test_mail_folders_and_search_criteria(fake_imap):
+    from hauski.tools import mailbox
+    m = FakeIMAP("h", 993)
+    fs = mailbox.folders(m)
+    assert mailbox.special(fs, "\\Drafts") == "Entw&APw-rfe" and mailbox.special(fs, "\\All") == "[Gmail].Alle Nachrichten"
+    assert mailbox.special([({"\\hasnochildren"}, "INBOX.Entw&APw-rfe")], "\\Drafts", ("entw&apw-rfe",)) == "INBOX.Entw&APw-rfe"
+    # Jedes Wort einzeln, nicht nur die exakte Wortfolge
+    cs, crit = mailbox._search_criteria(m, "Rechnung Telekom", gmail=False)
+    assert cs is None and crit[2:] == ["TEXT", '"Rechnung"', "TEXT", '"Telekom"']
+    # Umlaute ohne UTF-8-Modus: Zeichensatz UTF-8 mit Literal
+    cs, crit = mailbox._search_criteria(m, "Termin Müller", gmail=False)
+    assert cs == "UTF-8" and crit[-1] == "TEXT" and m.literal == "Müller".encode()
+    # Umlaute mit UTF8=ACCEPT: direkt
+    m2 = FakeIMAP("h", 993); m2.capabilities = ("IMAP4REV1", "ENABLE", "UTF8=ACCEPT")
+    cs, crit = mailbox._search_criteria(m2, "Müller", gmail=False)
+    assert cs is None and ("ENABLE", "UTF8=ACCEPT") in m2.log and crit[-1] == '"Müller"'
+    cs, crit = mailbox._search_criteria(m, "Strom 2025", gmail=True)
+    assert crit == ["X-GM-RAW", '"Strom 2025"']
+    assert mailbox._q('a"b\\c') == '"a\\"b\\\\c"'
+    assert mailbox.clean_password("gmail", "abcd efgh ijkl mnop") == "abcdefghijklmnop"
+    assert mailbox.clean_password("gmx", "mit Leer zeichen") == "mit Leer zeichen"
+
+
+def test_mail_login_utf8_and_german_gmail(client, fake_imap):
+    from hauski.tools import mailbox
+    r = client.post("/api/accounts", json={"kind": "gmail", "address": "anna@gmail.com", "password": "falsch"})
+    assert r.status_code == 400 and "App-Passwort" in r.json()["detail"]
+    r = client.post("/api/accounts", json={"kind": "gmail", "address": "anna@gmail.com", "password": "Grüße-Straße€1"})
+    assert r.status_code == 200, r.text
+    m = FakeIMAP.instances[-1]
+    assert m.host == "imap.gmail.com" and m.port == 993 and m.log[0][0] == "AUTH"
+    assert m.log[0][2] == b"\0anna@gmail.com\0" + "Grüße-Straße€1".encode()
+    # Gmail: Suche im Ordner mit \All, egal wie er in der Kontosprache heißt
+    user = db.row("SELECT * FROM users WHERE id=1")
+    from hauski.tools import Ctx
+    import asyncio
+    res = asyncio.run(mailbox.search(Ctx(user=user, perms={}, sources={"mail"}), {"query": "Rechnung", "account": "gmail"}))
+    m = FakeIMAP.instances[-1]
+    assert ("SELECT", '"[Gmail].Alle Nachrichten"') in m.log
+    assert [x["subject"] for x in res.text] == ["Rechnung 2", "Rechnung 1"]
+    # Server ohne AUTH=PLAIN: LOGIN nur mit ASCII, sonst verständliche Meldung
+    FakeIMAP.caps = ("IMAP4REV1",)
+    r = client.post("/api/accounts", json={"kind": "webde", "address": "a@web.de", "password": "Grüße-Straße€1"})
+    assert r.status_code == 400 and "Sonderzeichen" in r.json()["detail"]
+    r = client.post("/api/accounts", json={"kind": "webde", "address": "a@web.de", "password": "einfach 123", "username": "anna"})
+    assert r.status_code == 200 and FakeIMAP.instances[-1].log[0] == ("LOGIN", "anna", "einfach 123")
+    assert FakeIMAP.instances[-1].host == "imap.web.de"
+    accs = client.get("/api/accounts").json()
+    assert {a["label"] for a in accs["accounts"]} >= {"Gmail", "WEB.DE"}
+    assert {p["id"] for p in accs["providers"]} >= {"gmx", "webde", "gmail", "tonline", "icloud", "yahoo", "imap"}
+
+
+def test_mail_account_validation(client, fake_imap):
+    assert client.post("/api/accounts", json={"kind": "imap", "address": "x@y.de", "password": "p", "host": ""}).status_code == 400
+    assert client.post("/api/accounts", json={"kind": "imap", "address": "x@y.de", "password": "p", "host": "a b"}).status_code == 400
+    assert client.post("/api/accounts", json={"kind": "imap", "address": "x@y.de", "password": "p", "host": "imap.y.de",
+                                              "security": "none"}).status_code == 400  # unverschlüsselt nie
+    assert client.post("/api/accounts", json={"kind": "gmx", "address": "keine-adresse", "password": "p"}).status_code == 400
+    assert client.post("/api/accounts", json={"kind": "gmx", "address": "x@gmx.de", "password": ""}).status_code == 400
+    settings.set_many({"ms.client_id": "", "ms.client_secret": ""})
+    r = client.post("/api/accounts", json={"kind": "outlookcom", "address": "x@outlook.com"})
+    assert r.status_code == 400 and "Microsoft 365" in r.json()["detail"]
+    settings.set_many({"mail.allow_imap": False})
+    assert client.post("/api/accounts", json={"kind": "tonline", "address": "x@t-online.de", "password": "Grüße-Straße€1"}).status_code == 400
+    assert "tonline" not in {p["id"] for p in client.get("/api/accounts").json()["providers"]}
+    settings.set_many({"mail.allow_imap": True})
+    # STARTTLS wird vor der Anmeldung ausgeführt
+    r = client.post("/api/accounts", json={"kind": "imap", "address": "x@y.de", "password": "Grüße-Straße€1", "host": "mail.y.de",
+                                           "port": 143, "security": "starttls"})
+    assert r.status_code == 200 and FakeIMAP.instances[-1].log[0] == ("STARTTLS",)
+
+
+def test_mail_invoice_detection():
+    import datetime as dt
+    from hauski.tools.mailbox import classify
+    today = dt.date(2026, 11, 13)
+    c = classify({"subject": "Ihre Rechnung 11/2026", "text": "Betrag 49,90 € wird am 01.12.2026 abgebucht. Fällig am 1.12.26."}, today)
+    assert c == {"kind": "Rechnung", "due": "2026-12-01", "amount": "49,90 €"}
+    assert classify({"subject": "2. Mahnung", "text": "Bitte zahlen Sie bis zum 20.11.2026."}, today)["kind"] == "Mahnung"
+    # Stichwort nur im Text: braucht Datum oder Betrag
+    assert classify({"subject": "Hallo", "text": "Die Rechnung schicke ich später."}, today) is None
+    assert classify({"subject": "Hallo", "text": "Die Rechnung über EUR 12,00 ist bezahlt."}, today)["amount"] == "12,00 €"
+    # Werbung nie, vergangene und weit entfernte Daten zählen nicht als Frist
+    assert classify({"subject": "Newsletter: Rechnung sparen mit 20 %", "text": "fällig am 01.12.2026"}, today) is None
+    assert classify({"subject": "Rechnung", "text": "fällig am 01.01.2020"}, today)["due"] is None
+    assert classify({"subject": "Kündigung bestätigt", "text": "Vertrag endet am 31.12.2026."}, today) == {"kind": "Frist", "due": "2026-12-31", "amount": ""}
+
+
+def test_mailboxes_are_searched_in_parallel(client, monkeypatch):
+    import asyncio
+    import time
+    from hauski.tools import Ctx, mailbox
+    uid = db.scalar("SELECT id FROM users WHERE name='Anna'")
+    for i in range(3):
+        db.run("INSERT INTO accounts(user_id,kind,address,secret,config,created) VALUES(?,?,?,?,?,?)",
+               (uid, "webde", f"p{i}@web.de", security.encrypt("x"), "{}", db.now()))
+
+    def slow(acc, query, limit=6):
+        time.sleep(0.6)
+        return [{"id": f"{acc['id']}:SU5CT1g:1", "folder": "Posteingang", "ts": 1.0, "subject": acc["address"], "from": "x",
+                 "date": "", "message_id": "", "text": ""}]
+    monkeypatch.setattr(mailbox, "_imap_search", slow)
+    t = time.time()
+    res = asyncio.run(mailbox.search(Ctx(user=db.row("SELECT * FROM users WHERE id=?", (uid,)), perms={}, sources={"mail"}),
+                                     {"query": "x", "account": "web.de"}))
+    assert time.time() - t < 1.5, "Postfächer wurden nacheinander statt gleichzeitig durchsucht"
+    assert {x["subject"] for x in res.text} >= {"p0@web.de", "p1@web.de", "p2@web.de"}
+    db.run("DELETE FROM accounts WHERE kind='webde' AND address LIKE 'p_@web.de'")
+
+
+def test_expired_sessions_are_removed(client):
+    from hauski import scheduler
+    db.run("INSERT INTO sessions(id,user_id,created,last_seen) VALUES('alt-1',1,?,?)", (db.now() - 40 * 86400, db.now() - 40 * 86400))
+    db.run("INSERT INTO sessions(id,user_id,created,last_seen) VALUES('frisch-1',1,?,?)", (db.now(), db.now()))
+    r = scheduler.retention()
+    assert r["sessions"] >= 1
+    assert not db.row("SELECT 1 FROM sessions WHERE id='alt-1'") and db.row("SELECT 1 FROM sessions WHERE id='frisch-1'")
+
+
+def test_lost_microsoft_session_is_logged_once(client, monkeypatch):
+    from hauski import auth
+    count = lambda: db.scalar("SELECT COUNT(*) FROM audit WHERE text LIKE '%Sitzung kam nicht an%'")
+    before = count()
+    # Ohne vorherige Microsoft-Anmeldung: nichts ins Protokoll (Schutz gegen Spam von außen)
+    assert _fresh().post("/auth/lost-session", json={"standalone": True}).json() == {"ok": False}
+    assert count() == before
+
+    async def fake_exchange(code, verifier, tenant=None):
+        return {"id_token": "x", "access_token": "a", "refresh_token": "r", "expires_in": 3600}
+    monkeypatch.setattr(auth, "exchange", fake_exchange)
+    monkeypatch.setattr(auth, "validate_id_token", lambda tok, nonce: {"roles": ["HausKI.Member"], "oid": "oid-lost", "name": "Ella",
+                                                                       "email": "ella@example.org", "nonce": "n"})
+    db.kv_set("oidc:lost1", {"v": "v", "n": "n", "p": "login", "t": __import__("time").time(), "tenant": None})
+    r = _fresh().get("/auth/callback?code=c&state=lost1", follow_redirects=False)
+    assert r.headers["location"].startswith("/?angemeldet=")
+    # Die App meldet sich ohne Cookie zurück: einmal protokollieren, mit Hinweis auf die Home-Bildschirm-App
+    ios = {"user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15"}
+    assert _fresh().post("/auth/lost-session", json={"standalone": True}, headers=ios).json() == {"ok": True}
+    assert count() == before + 1
+    assert "iPhone/iPad, App vom Home-Bildschirm" in db.scalar("SELECT text FROM audit WHERE text LIKE '%Sitzung kam nicht an%' ORDER BY id DESC")
+    assert _fresh().post("/auth/lost-session", json={"standalone": True}).json() == {"ok": False}
+    assert count() == before + 1

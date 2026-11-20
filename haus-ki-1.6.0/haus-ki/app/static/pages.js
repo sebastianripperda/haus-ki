@@ -17,7 +17,7 @@ function renderBody() {
 }
 
 function renderStart(wrap) {
-  const st = S.start || { suggestions: [], deadlines: [], calendar: [] };
+  const st = Object.assign({ suggestions: [], deadlines: [], calendar: [], mails: [] }, S.start || {});
   const hero = h("div", { class: "hero" }, h("div", { class: "wm", "aria-hidden": "true" }, "HAUS-KI"),
     h("div", null, h("div", { class: "over" }, "Hallo " + S.me.name),
       h("h1", { style: { marginTop: "8px" } }, "Frag deine Daten.", h("span", { class: "l2" }, "Lokal beantwortet.")),
@@ -39,12 +39,22 @@ function renderStart(wrap) {
       bg: days <= 7 ? "var(--errbg)" : days <= 14 ? "var(--badge-warn-bg)" : "var(--fill)", fg: days <= 7 ? "var(--err)" : days <= 14 ? "var(--badge-warn-fg)" : "var(--info)",
       actions: [["Erledigt", () => doneInsight(d.id)]] });
   }
+  // Rechnungen, Mahnungen und Fristen aus den privaten Postfächern (Nachtplan)
+  for (const m of st.mails) {
+    const days = m.due ? Math.round((new Date(m.due) - new Date(new Date().toDateString())) / 86400000) : null;
+    const urgent = m.kind === "Mahnung" || (days !== null && days <= 7);
+    items.push({ sort: m.due || "9999", when: days === null ? m.kind : days <= 0 ? "heute" : days <= 14 ? `Frist ${days} T` : `Frist ${Math.round(days / 7)} Wo`,
+      kind: m.kind + " per Mail", title: m.title, detail: [m.from, m.amount, m.account].filter(Boolean).join(" · "),
+      bg: urgent ? "var(--errbg)" : days !== null && days <= 14 ? "var(--badge-warn-bg)" : "var(--fill)", fg: urgent ? "var(--err)" : days !== null && days <= 14 ? "var(--badge-warn-fg)" : "var(--info)",
+      actions: [["Im Chat öffnen", () => { setDraft(`Lies die Mail „${m.title}“ (Mail-ID ${m.mail_id}) und sag mir kurz, was zu tun ist und bis wann.`); S.sources = new Set(["mail"].filter((x) => S.me.features[x])); saveSources(); renderComposer(); R.ta.focus(); }],
+        ["Erledigt", () => doneInsight(m.id)]] });
+  }
   items.sort((a, b) => (a.sort < b.sort ? -1 : 1));
   if (items.length) {
     const shown = S.blickAll ? items : items.slice(0, 3);
     hero.appendChild(h("section", { class: "card blick-card", style: { padding: "14px 16px" } },
       h("div", { style: { display: "flex", justifyContent: "space-between", gap: "12px", flexWrap: "wrap", marginBottom: "6px" } }, h("h2", { style: { fontSize: "17px", fontWeight: 700 } }, "Im Blick"),
-        h("span", { class: "tiny muted" }, "Fristen aus Paperless und Überschneidungen im Familienkalender")),
+        h("span", { class: "tiny muted" }, "Fristen aus Paperless, Rechnungen aus deinen Postfächern und Überschneidungen im Familienkalender")),
       shown.map((it) => h("div", { class: "blick-row" }, h("span", { class: "when", style: { background: it.bg, color: it.fg } }, it.when),
         h("span", { style: { flex: "1 1 auto", minWidth: 0 } }, it.url ? h("a", { class: "ell", href: it.url, target: "_blank", rel: "noopener", style: { display: "block", fontWeight: 600, color: "var(--text)" } }, it.title) : h("span", { class: "ell", style: { display: "block", fontWeight: 600 } }, it.title),
           h("span", { class: "ell tiny muted", style: { display: "block" } }, it.kind + (it.detail ? ": " + it.detail : ""))),

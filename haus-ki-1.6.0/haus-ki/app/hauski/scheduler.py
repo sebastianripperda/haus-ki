@@ -105,8 +105,14 @@ def retention() -> dict:
     db.run("DELETE FROM night_runs WHERE started<?", (time.time() - 30 * 86400,))
     db.run("DELETE FROM tool_log WHERE ts<?", (time.time() - 90 * 86400,))
     db.run("DELETE FROM insights WHERE done=1 AND created<?", (time.time() - 30 * 86400,))
-    db.run("DELETE FROM kv WHERE key LIKE 'oidc:%'")
-    return {"chats": n}
+    db.run("DELETE FROM kv WHERE key LIKE 'oidc:%' OR key LIKE 'cb:%'")
+    db.run("DELETE FROM insights WHERE kind='mail' AND created<?", (time.time() - 45 * 86400,))
+    # Abgelaufene Sitzungen: zu lange ohne Aktivität oder älter als die Höchstdauer
+    from .auth import MAX_AGE
+    idle = float(settings.get("session.idle_hours") or 8) * 3600
+    sessions = db.scalar("SELECT COUNT(*) FROM sessions WHERE last_seen<? OR created<?", (time.time() - idle, time.time() - MAX_AGE)) or 0
+    db.run("DELETE FROM sessions WHERE last_seen<? OR created<?", (time.time() - idle, time.time() - MAX_AGE))
+    return {"chats": n, "sessions": sessions}
 
 
 # ------------------------------------------------------------ Nachtaufgaben
@@ -153,6 +159,44 @@ async def task_deadlines() -> str:
                 found += 1
         db.kv_set("paperless_last_id", max(db.kv_get("paperless_last_id", 0), d["id"]))
     return f"{len(docs)} Dokumente geprüft, {found} Fristen"
+
+
+async def task_mail() -> str:
+    """Neue Mails in den privaten Postfächern auf Rechnungen, Mahnungen und Fristen prüfen."""
+    if not settings.get("mail.night_scan"):
+        return "ausgeschaltet"
+    from .tools import mailbox
+    checked = found = 0
+    today = dt.date.today()
+    for u in db.rows("SELECT * FROM users WHERE disabled=0"):
+        if not users.perms(u).get("mail"):
+            continue
+        for a in mailbox.accounts(u["id"]):
+            if not (a["secret"] and mailbox.allowed(a["kind"])):
+                continue
+            cfg = db.jload(a["config"], {}) or {}
+            try:
+                since = dt.date.fromisoformat(cfg.get("scan_since") or "")
+            except ValueError:
+                since = today - dt.timedelta(days=3)  # erster Lauf: die letzten drei Tage
+            try:
+                items = await mailbox.recent(a, since)
+            except Exception as e:  # noqa: BLE001 – ein Postfach darf die anderen nicht aufhalten
+                mailbox.mark(a["id"], str(e)[:300])
+                continue
+            for it in items:
+                checked += 1
+                hit = mailbox.classify(it, today)
+                ref = f"{a['id']}:{it['ref']}"
+                if not hit or db.scalar("SELECT 1 FROM insights WHERE user_id=? AND kind='mail' AND ref=?", (u["id"], ref)):
+                    continue
+                db.run("INSERT INTO insights(user_id,kind,ref,data,created) VALUES(?,?,?,?,?)", (u["id"], "mail", ref, db.jdump({
+                    "title": (it.get("subject") or "(ohne Betreff)")[:140], "from": (it.get("from") or "")[:80],
+                    "account": a["address"], "mail_id": it["id"], **hit}), time.time()))
+                found += 1
+            mailbox.set_conf(a["id"], scan_since=today.isoformat())
+            mailbox.mark(a["id"], None)
+    return f"{checked} Mails geprüft, {found} mit Rechnung oder Frist"
 
 
 async def task_semantic() -> str:
@@ -217,6 +261,7 @@ async def night_plan() -> None:
     tasks = [("Sicherung", lambda: asyncio.to_thread(backup_now)),
              ("Aufräumen nach Aufbewahrungsfrist", lambda: asyncio.to_thread(retention)),
              ("Fristen-Wächter", task_deadlines),
+             ("Postfächer: Rechnungen und Fristen", task_mail),
              ("Paperless-Index", task_semantic),
              ("Chat-Index", task_history),
              ("Familienkalender-Abgleich", task_calendar),
@@ -244,6 +289,10 @@ def _notify_morning() -> None:
         n_cal = db.scalar("SELECT COUNT(*) FROM insights WHERE user_id=? AND kind='calendar'", (u["id"],)) or 0
         if n_dead and p.get("notify_deadlines"):
             notify(u["id"], f"{n_dead} neue Frist(en) aus Paperless erkannt.", "#start")
+        n_mail = db.scalar("SELECT COUNT(*) FROM insights WHERE user_id=? AND kind='mail' AND done=0 AND created>?",
+                           (u["id"], time.time() - 6 * 3600)) or 0
+        if n_mail and p.get("notify_mail"):
+            notify(u["id"], f"{n_mail} neue Mail(s) mit Rechnung oder Frist in deinen Postfächern.", "#start")
         if n_cal and p.get("notify_calendar"):
             notify(u["id"], f"{n_cal} Überschneidung(en) im Familienkalender in den nächsten 7 Tagen.", "#start")
 
